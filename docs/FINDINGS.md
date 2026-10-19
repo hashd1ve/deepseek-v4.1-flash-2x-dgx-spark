@@ -149,6 +149,14 @@ Each change has a test that fails without it. On the same synthetic session (`te
 The greedy replies, the template's ids, tool calls, image replies, resumed prompts and decode speed are unchanged
 (the checks in [`tests/`](../tests)). A `/tokenize` of 296K tokens peaks at +44 MiB instead of +235.
 
+**Longer runs.** The same session carried on for 250 turns, from ~195K to 447K tokens and from 30 to 113
+screenshots, with a second session of 60K-134K tokens (a subagent) taking turns at the same time: no stop, turns of
+3-9 s, the page cache steady at 1.39 GiB (the watchdog acts under 1 GiB). A new 440K-token session with 60 screenshots
+was built in 265 s (+330 MiB on rank 0 while it ran: the tower's rows for all 60 at once) and then took turns of 3.5-8.7
+s. Rank 0's RSS steps up once, ~0.3 GiB on the first large prompt pass (a few blocks of 14-64 MiB and the prompt
+cache's keys), and then stays flat: 3,099 to 3,123 MiB over 40 turns. Its memory comes from Zig's own allocator in
+ReleaseSafe builds, not glibc's, so glibc's malloc settings do not change it.
+
 **Down anyway.** [`ops/keep_serving.sh`](../ops/keep_serving.sh) runs `./start.sh restart` when a rank goes down without
 `./stop.sh`, at most 3 times in 2 hours. Stopping rank 0 by hand, as the watchdog does, gave a 67-second outage.
 
