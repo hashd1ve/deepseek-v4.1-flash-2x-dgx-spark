@@ -108,7 +108,10 @@ time. A value its invoke closes before its own closer ends that call, and the ne
 scripted server, a 68-chunk `write` call now arrives as 32 argument deltas from 0.76 s to 3.3 s instead of one at
 3.3 s, with the same arguments and `finish_reason: tool_calls` (and as `input_json_delta` events on `/v1/messages`).
 A call the reply's length cuts off now reaches the client open, as a streamed XML call already did; before, it was
-dropped. The engine's server tests (70 + 33 + 17) and its parity goldens pass; not yet measured on the pair.
+dropped. The engine's server tests (70 + 33 + 17) and its parity goldens pass. On the pair, an ~80-line
+`write_file` call ([`tests/stream_tool_call.py`](../tests/stream_tool_call.py), greedy, thinking on) arrived in two
+runs as 159 and 163 argument deltas spread over the 7 and 12 s it took to write, each the same call as the
+unstreamed reply; the other checks in [`tests/`](../tests) gave the same results as before the patch.
 
 ## Also found
 

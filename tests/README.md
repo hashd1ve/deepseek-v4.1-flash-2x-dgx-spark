@@ -1,7 +1,7 @@
 # Checks
 
 Small clients for a running server. Set `BASE_URL` (default `http://127.0.0.1:18891`) and, if yours differs, `MODEL`.
-All of them send greedy requests with thinking off.
+All of them send greedy requests, with thinking off except `stream_tool_call.py`, which sends it on as OpenCode does.
 
 | Check | What it shows | Our result |
 | --- | --- | --- |
@@ -13,6 +13,7 @@ All of them send greedy requests with thinking off.
 | `images.py DOC record\|check FILE` | a turn with the same image resumes past it with the same reply; another image does not resume past it | resumed at 6,144 of 6,912, identical |
 | `interleave.py DOC` | another stream keeps decoding while a new ~57K-token prompt runs, and the prompt's reply equals its repeat | 100 text chunks meanwhile (0 with whole passes), identical |
 | `prefill_speed.py DOC REPS` | prompt tokens a second for a new prompt | ~2,100 tok/s alone |
+| `stream_tool_call.py` | a long tool call's arguments arrive in many deltas while they are written, and join to the same call as the unstreamed reply | 159 and 163 deltas over 7 and 12 s, the same call |
 
 `DOC` is any text file of a few thousand tokens (we used engine source files). `conversations.py` generates the
 random conversations, covering every path of the DeepSeek-V4.1 template: tools, tool calls with object and string
