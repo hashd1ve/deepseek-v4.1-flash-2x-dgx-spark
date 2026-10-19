@@ -13,8 +13,8 @@ the recipe's README.
 
 docker/patches/ are changes to Bertholomus AI's TensorFold fork, branch deepseek-v41-zig
 (https://github.com/bertholomus/TensorFold, Apache-2.0), itself a fork of TensorFold
-(https://github.com/ashhart/TensorFold, Apache-2.0). They are proposed upstream as bertholomus/TensorFold #25, #28
-and #29.
+(https://github.com/ashhart/TensorFold, Apache-2.0). 0001-0004 are bertholomus/TensorFold #25, #28 (merged) and #29;
+0005 is ours and not proposed upstream yet.
 
 model/chat_template.jinja is the template the checkpoint easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw carries,
 written by Mia's AI Lab as a port of DeepSeek's encoding/encoding.py (DeepSeek, MIT), with one change: each piece of

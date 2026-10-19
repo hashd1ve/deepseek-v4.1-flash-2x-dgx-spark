@@ -11,7 +11,7 @@ It starts from [easthambuilds' recipe](https://github.com/easthambuilds/DeepSeek
 
 | | |
 | --- | --- |
-| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `629c524a`, which includes two of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#26](https://github.com/bertholomus/TensorFold/pull/26)), plus [`docker/patches/`](docker/patches): four commits from [#25](https://github.com/bertholomus/TensorFold/pull/25), [#28](https://github.com/bertholomus/TensorFold/pull/28) and [#29](https://github.com/bertholomus/TensorFold/pull/29), not merged yet |
+| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `629c524a`, which includes two of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#26](https://github.com/bertholomus/TensorFold/pull/26)), plus [`docker/patches/`](docker/patches): [#25](https://github.com/bertholomus/TensorFold/pull/25), [#28](https://github.com/bertholomus/TensorFold/pull/28) (merged after this pin), [#29](https://github.com/bertholomus/TensorFold/pull/29) and tool calls streamed as they are written (`0005`) |
 | Chat template | [`model/chat_template.jinja`](model/chat_template.jinja): the published template, rendering the same prompt without rank 0's memory growing with the conversation |
 | Recipe | easthambuilds' scripts with the changes from [easthambuilds#1](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold/pull/1) (the 512/513-token kit variant, kept rank caches, a CDI preflight, settings for a tight memory budget) and prompt passes in pieces |
 | Operations | [`ops/`](ops): the kernel memory settings and the memory watchdog we serve with |
@@ -39,6 +39,9 @@ details.
 - **A tool call quoted inside a file the model writes could stream as a real call**, and the model's own call was
   then never sent. [#25](https://github.com/bertholomus/TensorFold/pull/25) reads DSML blocks first and streams calls
   only from the text before them, as the engine's Python server already does.
+- **A long tool call looked like a hang.** The engine held a DSML calls block until the reply ended, so while the model
+  wrote a long call the client saw nothing: ~4 min still on one token in one of our sessions. `docker/patches/0005`
+  streams each call's name as soon as it is written and its arguments as they come, as OpenAI-compatible servers do.
 
 ## Results
 

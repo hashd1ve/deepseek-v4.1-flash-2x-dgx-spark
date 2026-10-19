@@ -90,6 +90,26 @@ native side of the engine's Python fix: DSML blocks are read first, from their o
 text before the first block; an unoffered tool comes back as a call for the client to answer. Two tests fail before
 the change and pass after it.
 
+## 6. A long tool call looked like a hang
+
+**Symptom.** In an OpenCode session at 142K tokens, the reply stopped on one token for ~4 min, then went on. The
+engine was decoding the whole time (~95 tok/s, 32,000 tokens in 7 min); none of it reached the client.
+
+**Cause.** While a reply streams, the server hides a tool-call block from the text and sends the calls when the reply
+ends. A DSML calls block is one call's whole arguments, so an agent writing a large file sends nothing for as long as
+the file takes to write.
+
+**Fix.** [`docker/patches/0005`](../docker/patches), ours: the streamer reads DeepSeek-V4.1's calls block as the final
+parser reads it and sends each invoke's opening delta (index, id, name) once its name is written, a string value's
+text as it comes, and a JSON value (`string="false"`) at its closer, as the engine already did for Qwen's XML calls.
+For a well-formed reply, what a client joins is the parsed call's arguments, byte for byte: a test feeds one with
+escapes, non-ASCII text, a `</` inside a value, an unoffered tool and a value that is not JSON, one character at a
+time. A value its invoke closes before its own closer ends that call, and the next one still streams. On the engine's
+scripted server, a 68-chunk `write` call now arrives as 32 argument deltas from 0.76 s to 3.3 s instead of one at
+3.3 s, with the same arguments and `finish_reason: tool_calls` (and as `input_json_delta` events on `/v1/messages`).
+A call the reply's length cuts off now reaches the client open, as a streamed XML call already did; before, it was
+dropped. The engine's server tests (70 + 33 + 17) and its parity goldens pass; not yet measured on the pair.
+
 ## Also found
 
 - **The prompt cache restored states exactly.** We checked this when the model answered in Chinese mid-session (a
