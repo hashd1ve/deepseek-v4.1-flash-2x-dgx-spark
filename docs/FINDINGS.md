@@ -51,7 +51,7 @@ other session waited.
 **Cause.** The prompt cache matched tokens, and an image's span is the same placeholder token for every image, so the
 engine kept nothing for a prompt with images and looked nothing up.
 
-**Fix.** [#28](https://github.com/bertholomus/TensorFold/pull/28) ([`docker/patches/0002`](../docker/patches)): the
+**Fix.** [#28](https://github.com/bertholomus/TensorFold/pull/28) (merged, in the engine pin): the
 cache key spells each image span by the image's digest, one id per position past every vocabulary. A turn with the
 same image resumes past it (6,144 of 6,912 tokens in `tests/images.py`), with the same reply as when the prompt ran
 whole. The same text with another image resumes only before the image.
@@ -61,7 +61,7 @@ whole. The same text with another image resumes only before the image.
 **Symptom.** A prompt pass ran whole inside its admission, so every decoding stream waited for it. That meant ~4 min
 for a 400K-token session reloading after a restart.
 
-**Fix.** [#29](https://github.com/bertholomus/TensorFold/pull/29) ([`docker/patches/0003`, `0004`](../docker/patches)).
+**Fix.** [#29](https://github.com/bertholomus/TensorFold/pull/29) (merged, in the engine pin).
 With `TF_FILL_CHUNKS` set and another stream decoding, a prompt pass runs in pieces, with `TF_FILL_ROUNDS` of the
 others' rounds between them.
 - **Same frames on both ranks.** Rank 1 already handles any frame between two chunks of a fill, so both ranks run the

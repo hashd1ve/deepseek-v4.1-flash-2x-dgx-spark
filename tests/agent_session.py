@@ -1,14 +1,15 @@
-# agent_session.py TOKENS_K IMAGES TURNS: an agent session as OpenCode sends it, grown to about TOKENS_K thousand tokens
+# agent_session.py TOKENS_K IMAGES TURNS [SEED]: an agent session as OpenCode sends it, grown to about TOKENS_K thousand tokens
 # with IMAGES screenshots, then TURNS more turns (a tool call and its result each, a new screenshot every third one).
 # Each turn prints the tokens resumed, the seconds to the reply and, run on the head, rank 0's RSS before and at its
 # peak and the host's lowest MemFree and page cache while it ran (memory_watchdog.sh stops the engine under 3 GiB free
-# with under 1 GiB of cache).
+# with under 1 GiB of cache). Sessions with another SEED share the system prompt and tools, as a subagent's does.
 import json, os, random, subprocess, sys, threading, time
 from common import MODEL, post
 from screenshot_turns import screenshot
 
 tokens_k, images, turns = int(sys.argv[1]), int(sys.argv[2]), int(sys.argv[3])
-r = random.Random(5)
+seed = int(sys.argv[4]) if len(sys.argv) > 4 else 5
+r = random.Random(5)  # the harness: the same for every session
 WORDS = ("the of and to in is for on that with as by at from this be or are not file line return value self import def "
          "class if else while try except raise None True config server request response token model cache state").split()
 
@@ -27,6 +28,8 @@ def step(i, size):
 tool = lambda name: {"type": "function", "function": {"name": name, "description": text(1200), "parameters": {"type": "object", "properties": {"filePath": {"type": "string"}}, "required": ["filePath"]}}}
 TOOLS = [tool(n) for n in ["bash", "read", "write", "edit", "glob", "grep", "list", "task", "todowrite", "webfetch"]]
 msgs = [{"role": "system", "content": text(38000)}, {"role": "user", "content": "Fix the failing tests."}]
+if len(sys.argv) > 4:
+    r = random.Random(seed)  # another conversation (without SEED, the one the numbers in docs/FINDINGS.md come from)
 budget, i, shots = tokens_k * 1000 * 4, 0, 0  # ~4 characters a token
 every = max(1, budget // 5600 // max(images, 1))  # a step is ~5,600 characters: the screenshots spread over the session
 size = 38000 + sum(len(json.dumps(t)) for t in TOOLS)
@@ -34,7 +37,7 @@ while size < budget:  # the text only: a screenshot's tokens are its span's, not
     msgs += step(i, r.choice([1500, 2500, 4000, 8000]))
     size += sum(len(json.dumps(m)) for m in msgs[-2:])
     if shots < images and i % every == 0:
-        msgs.append({"role": "user", "content": [{"type": "text", "text": "Here is the screen now."}, {"type": "image_url", "image_url": {"url": screenshot(1000 + shots)}}]})
+        msgs.append({"role": "user", "content": [{"type": "text", "text": "Here is the screen now."}, {"type": "image_url", "image_url": {"url": screenshot(1000 * (seed - 4) + shots)}}]})
         shots += 1
     i += 1
 msgs.append({"role": "user", "content": "Go on."})
@@ -71,6 +74,6 @@ for t in range(turns + 1):
     msgs += step(i, r.choice([1500, 2500, 4000]))
     i += 1
     if t % 3 == 2:
-        msgs.append({"role": "user", "content": [{"type": "text", "text": "And now?"}, {"type": "image_url", "image_url": {"url": screenshot(1000 + shots)}}]})
+        msgs.append({"role": "user", "content": [{"type": "text", "text": "And now?"}, {"type": "image_url", "image_url": {"url": screenshot(1000 * (seed - 4) + shots)}}]})
         shots += 1
     msgs.append({"role": "user", "content": "Go on."})
