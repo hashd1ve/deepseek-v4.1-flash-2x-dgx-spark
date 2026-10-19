@@ -1,0 +1,581 @@
+From 8cbe51b71438ecf6457556313d5f5fa149f23bf9 Mon Sep 17 00:00:00 2001
+From: Manrique <125496885+hashd1ve@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:20:12 +0100
+Subject: [PATCH 3/4] feat(lanes): a prompt pass runs in pieces between the
+ other streams' rounds (TF_FILL_CHUNKS, TF_FILL_ROUNDS)
+
+A prompt pass ran whole inside its admission, so every stream that was decoding stopped until it ended: on two GB10s
+a 400K-token prompt (a restarted agent session, or one whose state was lost) held the other sessions for ~4 min.
+
+The backend may offer prefill_part, the same pass in pieces of at most N chunks. When it does, TF_FILL_CHUNKS is set
+and another stream decodes, the lane core runs only the first piece at admission; the stream is then `filling` and
+fillStep runs a piece after every TF_FILL_ROUNDS rounds of the live streams (at once when none decodes), then draws
+its first token and joins the rounds. One pass fills at a time: the host admits the next request when it ends. A
+cancel or an error in a piece ends that request alone.
+
+dsv41: prefillFn becomes an opening (slot, extent, images, rank 1's fill, the kept state) and resumable chunks; the
+chunk loop's state lives in Lanes.fill between pieces. A piece ends with the read-ahead joined and the prompt's ids
+gone, as rank 1 does at any other frame, so both ranks run the same frames in the same order; rank 1 reads ahead
+again at the next chunk. Rounds leave the fill's view, rings, spans and image rows alone; the Engram read-ahead of a
+chunk is redone when none is pending. Unset, every pass runs whole as before.
+
+Test: a lane host with a stream decoding admits a six-chunk prompt; the decoding stream delivers tokens between
+every two pieces, and the new reply equals the fake's continuation of its prompt.
+---
+ zig/src/core/lane_host.zig       |  28 ++++++++-
+ zig/src/core/lane_host_test.zig  |  85 ++++++++++++++++++++++++++
+ zig/src/core/lanes/backend.zig   |   2 +
+ zig/src/core/lanes/engine.zig    |  48 ++++++++++++++-
+ zig/src/core/lanes/fake.zig      |  31 ++++++++--
+ zig/src/families/dsv41/lanes.zig | 100 +++++++++++++++++++++----------
+ zig/src/native/cuda.zig          |  15 +++++
+ 7 files changed, 270 insertions(+), 39 deletions(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index e53ae631..8baf2a36 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -51,6 +51,7 @@ pub const LaneHost = struct {
+     // and frees its extent (its kept state then resumes in place) instead of waiting out every queued pass, as the
+     // Python lane's fills leave decoding its share
+     finish_until: ?i96 = null,
++    filling: ?*Job = null, // the job whose prompt pass runs in pieces between rounds (core.filling's)
+ 
+     const Mark = struct { at: i96, tokens: u64 };
+     const full_retry_ns: i96 = std.time.ns_per_s;
+@@ -272,6 +273,7 @@ pub const LaneHost = struct {
+         dropped.deinit(h.gpa);
+         for (ids) |id| {
+             for (h.admitted.items, 0..) |job, i| if (job.id == id) {
++                if (h.filling == job) h.filling = null;
+                 if (!job.stream.finished) h.core.discard(&job.stream);
+                 h.lock();
+                 _ = h.admitted.orderedRemove(i);
+@@ -294,7 +296,7 @@ pub const LaneHost = struct {
+     /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
+     fn admitOne(h: *LaneHost) bool {
+         h.lock();
+-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
++        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
+             h.unlock();
+             return false;
+         }
+@@ -360,6 +362,10 @@ pub const LaneHost = struct {
+             if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
+             return h.drop(job, h.words(e));
+         };
++        if (h.core.filling == &job.stream) {
++            h.filling = job; // its next pieces run between rounds (fillOne)
++            return true;
++        }
+         h.prefilled(job, began);
+         const now = std.Io.Clock.awake.now(h.io).toNanoseconds();
+         if (now - began >= long_pass_ns) {
+@@ -509,10 +515,25 @@ pub const LaneHost = struct {
+         };
+     }
+ 
++    /// The filling job's next piece, when its turn has come; its first tokens once its prompt pass ends.
++    fn fillOne(h: *LaneHost) void {
++        const job = h.filling orelse return;
++        const done = h.core.fillStep() catch |e| {
++            h.filling = null;
++            _ = if (e == error.Cancelled) h.cancel(job) else h.drop(job, h.words(e));
++            return;
++        };
++        if (!done) return;
++        h.filling = null;
++        h.prefilled(job, job.began);
++        if (h.deliver(job)) h.remove(job);
++    }
++
+     fn run(h: *LaneHost) void {
+         while (true) {
+             h.takeCancels();
+             while (h.admitOne()) {}
++            h.fillOne();
+             h.noteLive();
+             h.lock();
+             if (h.closing) {
+@@ -523,6 +544,10 @@ pub const LaneHost = struct {
+                 continue;
+             }
+             if (h.core.activeCount() == 0) {
++                if (h.filling != null) {
++                    h.unlock();
++                    continue;
++                }
+                 if (h.cancels.items.len == 0 and (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes))
+                     h.wake.waitTimeout(h.io, &h.mutex, .{ .duration = .{ .raw = .fromMilliseconds(100), .clock = .awake } }) catch {};
+                 h.unlock();
+@@ -547,6 +572,7 @@ pub const LaneHost = struct {
+ 
+     /// A failed round ends every stream it held, with the backend's error.
+     fn failAll(h: *LaneHost, message: []const u8) void {
++        h.filling = null;
+         h.lock();
+         const jobs = h.gpa.dupe(*Job, h.admitted.items) catch &.{};
+         h.admitted.clearRetainingCapacity();
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 061a8711..3cb5c219 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -213,3 +213,88 @@ test "after a long prompt pass, a stream near its max_tokens ends before the nex
+     // the first request (64 tokens: within finish_left) ended before the second's first token
+     try std.testing.expect(seq.a_done.? < seq.b_first.?);
+ }
++
++test "a prompt pass in pieces: a decoding stream keeps its rounds between them, and the reply is the whole pass's" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    const Watch = struct {
++        mutex: std.Io.Mutex = .init,
++        a: usize = 0, // the first request's tokens delivered so far
++        seen: std.ArrayList(usize) = .empty, // that count at each chunk of a prompt pass
++        b: std.ArrayList(u32) = .empty,
++        a_done: bool = false,
++        b_done: bool = false,
++        fn hook(ctx: *anyopaque, _: *lanes.stream.Stream, _: usize) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            w.mutex.lockUncancelable(std.testing.io);
++            defer w.mutex.unlock(std.testing.io);
++            w.seen.append(gpa, w.a) catch {};
++        }
++        fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
++            const w: *@This() = @ptrCast(@alignCast(ctx));
++            w.mutex.lockUncancelable(std.testing.io);
++            defer w.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .tokens => |t| if (id == 1) {
++                    w.a += t.len;
++                } else w.b.appendSlice(gpa, t) catch {},
++                .finished => if (id == 1) {
++                    w.a_done = true;
++                } else {
++                    w.b_done = true;
++                },
++                else => {},
++            }
++        }
++        fn until(w: *@This(), comptime what: enum { a_decodes, b_done, a_done }) !void {
++            for (0..20000) |_| {
++                w.mutex.lockUncancelable(std.testing.io);
++                const ok = switch (what) {
++                    .a_decodes => w.a > 0,
++                    .b_done => w.b_done,
++                    .a_done => w.a_done,
++                };
++                w.mutex.unlock(std.testing.io);
++                if (ok) return;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++            return error.Timeout;
++        }
++    };
++    var w: Watch = .{};
++    defer w.seen.deinit(gpa);
++    defer w.b.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = Watch.hook, .prefill_hook_ctx = &w };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    core.fill_chunks = 1;
++    core.fill_rounds = 2;
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    try host.start();
++    defer host.stop();
++    const e = host.engine();
++    const pa = [_]u32{ 2, 7, 1, 8 };
++    const pb = [_]u32{ 3, 1, 4, 1, 5 };
++    try e.submit(1, &.{ .prompt = &pa, .max_tokens = 1_000_000 }, .{ .ctx = &w, .event = Watch.event });
++    try w.until(.a_decodes);
++    try e.submit(2, &.{ .prompt = &pb, .max_tokens = 8 }, .{ .ctx = &w, .event = Watch.event });
++    try w.until(.b_done);
++    e.cancel(1);
++    try w.until(.a_done);
++    // the first pass ran whole (nothing decoded yet); the second in six pieces, the first stream decoding between them
++    try std.testing.expectEqual(@as(usize, 12), w.seen.items.len);
++    for (w.seen.items[0..6]) |n| try std.testing.expectEqual(@as(usize, 0), n);
++    for (w.seen.items[7..12], w.seen.items[6..11]) |now, before| try std.testing.expect(now > before);
++    // the second reply is the fake's own continuation of its prompt
++    var history: std.ArrayList(u32) = .empty;
++    defer history.deinit(gpa);
++    try history.appendSlice(gpa, &pb);
++    try std.testing.expectEqual(@as(usize, 8), w.b.items.len);
++    for (w.b.items) |t| {
++        try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++        try history.append(gpa, t);
++    }
++}
+diff --git a/zig/src/core/lanes/backend.zig b/zig/src/core/lanes/backend.zig
+index ee95dc66..b7ef5b3c 100644
+--- a/zig/src/core/lanes/backend.zig
++++ b/zig/src/core/lanes/backend.zig
+@@ -49,6 +49,8 @@ pub const Backend = struct {
+     pub const VTable = struct {
+         /// Prefill the stream's prompt into its caches (and its draft head's).
+         prefill: *const fn (ptr: *anyopaque, s: *Stream) anyerror!void,
++        /// The same pass in pieces of at most `chunks` chunks, other streams' rounds between them; true once it is done.
++        prefill_part: ?*const fn (ptr: *anyopaque, s: *Stream, chunks: usize) anyerror!bool = null,
+         /// Draw the first token from the prompt's last row at `position`; a handle to it.
+         first: *const fn (ptr: *anyopaque, s: *Stream, position: u64) anyerror!u64,
+         /// Feed one token and queue the draw of the next at `position` (a one-token round); a handle to it.
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index 1199e77b..765afee5 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -38,6 +38,10 @@ pub const Engine = struct {
+     steps: u64 = 0,
+     arena: std.heap.ArenaAllocator, // a round's temporaries
+     unread: std.ArrayList(Unread) = .empty, // queued draws the log reads at the step's end
++    filling: ?*Stream = null, // a stream whose prompt pass runs in pieces between the others' rounds (not live yet)
++    fill_chunks: u32 = 0, // a piece's chunks (backend prefill_part; 0: a prompt pass runs whole inside addStream)
++    fill_rounds: u32 = 4, // the live streams' rounds between two pieces
++    rounds_since: u32 = 0,
+ 
+     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
+         return .{
+@@ -75,14 +79,52 @@ pub const Engine = struct {
+         return n;
+     }
+ 
+-    /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round.
++    /// Prefill a stream, draw its first token and ask for its first drafts; it takes part from the next round. While
++    /// other streams decode and the backend runs passes in pieces, only the first piece runs here: the stream is then
++    /// `filling` and fillStep runs the rest between rounds.
+     pub fn addStream(e: *Engine, s: *Stream) !void {
+         _ = e.arena.reset(.retain_capacity);
+         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+-        e.backend.prefill(s) catch |err| {
++        if (e.filling != null) return error.FillBusy;
++        if (e.fill_chunks > 0 and e.backend.vtable.prefill_part != null and e.activeCount() > 0) {
++            if (!try e.piece(s)) {
++                e.filling = s;
++                e.rounds_since = 0;
++                return;
++            }
++        } else e.backend.prefill(s) catch |err| {
+             if (err == error.Cancelled) e.backend.release(s); // the host finishes a cancelled stream without the core
+             return err;
+         };
++        try e.started(s);
++    }
++
++    fn piece(e: *Engine, s: *Stream) !bool {
++        return e.backend.vtable.prefill_part.?(e.backend.ptr, s, e.fill_chunks) catch |err| {
++            if (err == error.Cancelled) e.backend.release(s);
++            return err;
++        };
++    }
++
++    /// The filling stream's next piece once the live streams had their rounds (at once when none decodes); true when
++    /// its prompt pass ended and it joined the rounds. On an error the stream is no longer filling.
++    pub fn fillStep(e: *Engine) !bool {
++        const s = e.filling orelse return false;
++        if (e.activeCount() > 0 and e.rounds_since < e.fill_rounds) return false;
++        _ = e.arena.reset(.retain_capacity);
++        e.rounds_since = 0;
++        const done = e.piece(s) catch |err| {
++            e.filling = null;
++            return err;
++        };
++        if (!done) return false;
++        e.filling = null;
++        try e.started(s);
++        return true;
++    }
++
++    /// A prompt pass ended: the first token, the first drafts, and the rounds from the next one.
++    fn started(e: *Engine, s: *Stream) !void {
+         if (s.isCancelled()) { // cancelled in its last chunk: no first token
+             e.backend.release(s);
+             return error.Cancelled;
+@@ -129,6 +171,7 @@ pub const Engine = struct {
+ 
+     /// Release a cancelled stream between rounds: no pending draws or drafts.
+     pub fn discard(e: *Engine, s: *Stream) void {
++        if (e.filling == s) e.filling = null;
+         s.finished = true;
+         s.reason = .cancelled;
+         for (e.live.items, 0..) |x, i| {
+@@ -146,6 +189,7 @@ pub const Engine = struct {
+         const a = e.arena.allocator();
+         try trail.event(e, &.{ f("ev", str("step")), f("index", int(e.steps)) });
+         e.steps += 1;
++        if (e.filling != null) e.rounds_since += 1;
+         var live: std.ArrayList(*Stream) = .empty;
+         for (e.live.items) |s| {
+             if (!s.finished and !s.paused) try live.append(a, s);
+diff --git a/zig/src/core/lanes/fake.zig b/zig/src/core/lanes/fake.zig
+index bf22de25..490a7d09 100644
+--- a/zig/src/core/lanes/fake.zig
++++ b/zig/src/core/lanes/fake.zig
+@@ -23,6 +23,7 @@ const Lane = struct {
+     held: std.ArrayList(u32) = .empty, // drafts for the next round
+     base: usize = 0, // the history length before the last verify
+     rows: std.ArrayList(u32) = .empty, // the last verify's row tokens
++    pieces: usize = 0, // the prompt pass's chunks run so far (prefill_part)
+ };
+ 
+ pub const Fake = struct {
+@@ -55,7 +56,7 @@ pub const Fake = struct {
+     }
+ 
+     pub fn backend(x: *Fake) be.Backend {
+-        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
++        return .{ .ptr = x, .vtable = &.{ .prefill = prefill, .prefill_part = prefillPart, .first = first, .queue = queue, .read = read, .verify = verify, .keep = keep, .draft = draft, .release = release } };
+     }
+ 
+     fn self(ptr: *anyopaque) *Fake {
+@@ -99,6 +100,18 @@ pub const Fake = struct {
+ 
+     fn prefill(ptr: *anyopaque, s: *Stream) anyerror!void {
+         const x = self(ptr);
++        try x.open(s);
++        if (!try x.pieces(s, std.math.maxInt(usize))) unreachable;
++    }
++
++    /// The same pass, `chunks` of its prefill_chunks a call.
++    fn prefillPart(ptr: *anyopaque, s: *Stream, chunks: usize) anyerror!bool {
++        const x = self(ptr);
++        if (!x.lanes.contains(s)) try x.open(s);
++        return x.pieces(s, chunks);
++    }
++
++    fn open(x: *Fake, s: *Stream) !void {
+         if (x.refuse_sampled and s.sampling != null) return error.SamplingRefused;
+         if (x.refuse_full > 0 and x.lanes.count() > 0 and !x.lanes.contains(s)) {
+             x.refuse_full -= 1;
+@@ -107,13 +120,20 @@ pub const Fake = struct {
+         const got = try x.lanes.getOrPut(x.gpa, s);
+         if (got.found_existing) freeLane(x.gpa, got.value_ptr);
+         got.value_ptr.* = .{};
+-        const chunks = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
+-        for (0..chunks) |chunk| {
++    }
++
++    fn pieces(x: *Fake, s: *Stream, chunks: usize) !bool {
++        const l = x.lanes.getPtr(s).?;
++        const total = if (x.prefill_chunks == 0) 1 else x.prefill_chunks;
++        var ran: usize = 0;
++        while (l.pieces < total and ran < chunks) : (ran += 1) {
+             x.prefill_count += 1;
+-            if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, chunk);
++            if (x.prefill_hook) |hook| hook(x.prefill_hook_ctx.?, s, l.pieces);
++            l.pieces += 1;
+             if (s.isCancelled()) return error.Cancelled;
+         }
+-        const h = &got.value_ptr.history;
++        if (l.pieces < total) return false;
++        const h = &l.history;
+         s.cached = 0;
+         if (s.reuse.saved) |saved| { // the kept state's tokens stand in for the prompt's first `at`
+             const kept: *std.ArrayList(u32) = @ptrCast(@alignCast(saved));
+@@ -124,6 +144,7 @@ pub const Fake = struct {
+             try h.append(x.gpa, t);
+             if (std.mem.indexOfScalar(u32, s.reuse.marks, @intCast(at)) != null) if (s.reuse.hook) |k| k.at(k.ptr, s, @intCast(at));
+         }
++        return true;
+     }
+ 
+     /// A copy of the stream's cache at `at` tokens (the prompt pass stands there), for core/prompt_cache.zig.
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index 0e1af831..df73c0c6 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -295,6 +295,9 @@ fn noteStale(sn: *const Snap, why: []const u8) void {
+     if (sn.at >= note_rows) std.log.info("dsv41: the kept state of {d} tokens at {d} goes stale: {s}", .{ sn.at, sn.base, why });
+ }
+ 
++/// A prompt pass between its pieces: the chunk it runs next and what its chunk loop reads.
++const Fill = struct { s: *const lanes.Stream, slot: usize, len: usize, replay: usize, last_end: usize, start: usize, head: bool = false };
++
+ /// How long a request waits for the live stream that holds the kept state it resumes from to end (then it resumes
+ /// in place and every kept state stays) before other kept states give their room for a copy of it.
+ const held_wait_ns: u64 = 10 * std.time.ns_per_s;
+@@ -321,6 +324,7 @@ pub const Lanes = struct {
+     next: u64 = 0,
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
++    fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+@@ -347,6 +351,7 @@ pub const Lanes = struct {
+     pub fn backend(self: *Lanes) be.Backend {
+         return .{ .ptr = self, .vtable = &.{
+             .prefill = prefillFn,
++            .prefill_part = prefillPartFn,
+             .first = firstFn,
+             .queue = queueFn,
+             .read = readFn,
+@@ -421,14 +426,68 @@ pub const Lanes = struct {
+     /// The lowest free slot, the first extent that fits, the prompt in chunks of the served size (at multiples of it:
+     /// the chunks the gates checked; the host's chunk plan is not followed), the head's draw of the first token.
+     fn prefillFn(ptr: *anyopaque, s: *lanes.Stream) anyerror!void {
+-        const self = of(ptr);
++        if (!try of(ptr).prefillPart(s, std.math.maxInt(usize))) return error.FillUnfinished;
++    }
++
++    /// The prompt pass in pieces of `chunks` chunks (opened at its first): true once it reached the head and drew the first token.
++    fn prefillPartFn(ptr: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
++        return of(ptr).prefillPart(s, chunks);
++    }
++
++    fn prefillPart(self: *Lanes, s: *lanes.Stream, chunks: usize) !bool {
+         const m = self.m;
+-        const gpa = self.gpa;
+         const t0 = m.now();
+         defer if (self.prof) |*p| {
+             p.prefill += m.now() - t0;
+-            p.prefills += 1;
+         };
++        if (self.fill) |f| {
++            if (f.s != s) return error.FillBusy;
++        } else try self.fillOpen(s);
++        errdefer self.fill = null;
++        const f = &self.fill.?;
++        const seq = self.seqs[f.slot].items;
++        m.fill_seq = seq;
++        // a round may run before the next piece: the read-ahead done and the prompt's ids gone, as rank 1 does at its frame
++        defer {
++            m.joinAhead();
++            m.fill_seq = &.{};
++        }
++        var ran: usize = 0;
++        while (f.start < f.len and ran < chunks) : (ran += 1) {
++            const start = f.start;
++            const len = f.len;
++            if (start > 0 and s.isCancelled()) return error.Cancelled;
++            const n = @min(model.chunk_rows, len - start);
++            if (try self.begin(.fill_chunk)) {
++                try self.wire.int(self.gpa, u64, start);
++                try self.wire.int(self.gpa, u32, @intCast(n));
++                try self.wire.int(self.gpa, u64, f.replay);
++                try self.flush();
++            }
++            f.head = try m.fillChunk(seq[0 .. start + n], start, n, f.replay);
++            f.start += n;
++            if (s.reuse.hook) |k| if (f.start < len and f.start <= f.replay and (f.start == f.last_end or markEnds(s.reuse.marks, f.start))) k.at(k.ptr, s, @intCast(f.start));
++        }
++        if (f.start < f.len) return false;
++        const done = f.*;
++        self.fill = null;
++        if (self.prof) |*p| p.prefills += 1;
++        if (!done.head) return error.NoPromptLogits;
++        const logits = try m.promptLogitsHost();
++        if (logits_sha) {
++            var dg: [32]u8 = undefined;
++            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
++            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
++        }
++        const token = try draw(logits, done.len, s.sampling);
++        self.streams.getPtr(s).?.first = self.take(token);
++        return true;
++    }
++
++    /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
++    fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
++        const m = self.m;
++        const gpa = self.gpa;
+         const ids = s.prompt();
+         const len = ids.len;
+         if (len == 0) return error.EmptyPrompt;
+@@ -554,34 +613,7 @@ pub const Lanes = struct {
+         // where this pass keeps states: the cache's marks and its last chunk end before the replay (the served lane's
+         // kept prompt), each at the chunk end at or before it
+         const last_end = @min(replay, len - 1) / model.chunk_rows * model.chunk_rows;
+-        var head = false;
+-        m.fill_seq = seq.items;
+-        defer {
+-            m.joinAhead();
+-            m.fill_seq = &.{};
+-        }
+-        while (start < len) {
+-            if (start > 0 and s.isCancelled()) return error.Cancelled;
+-            const n = @min(model.chunk_rows, len - start);
+-            if (try self.begin(.fill_chunk)) {
+-                try self.wire.int(gpa, u64, start);
+-                try self.wire.int(gpa, u32, @intCast(n));
+-                try self.wire.int(gpa, u64, replay);
+-                try self.flush();
+-            }
+-            head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+-            start += n;
+-            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+-        }
+-        if (!head) return error.NoPromptLogits;
+-        const logits = try m.promptLogitsHost();
+-        if (logits_sha) {
+-            var dg: [32]u8 = undefined;
+-            std.crypto.hash.sha2.Sha256.hash(std.mem.sliceAsBytes(logits), &dg, .{});
+-            std.debug.print("{{\"prompt_logits\": \"{s}\", \"sha256\": \"{s}\"}}\n", .{ s.id, std.fmt.bytesToHex(dg, .lower) });
+-        }
+-        const token = try draw(logits, len, s.sampling);
+-        self.streams.getPtr(s).?.first = self.take(token);
++        self.fill = .{ .s = s, .slot = slot, .len = len, .replay = replay, .last_end = last_end, .start = start };
+     }
+ 
+     fn firstFn(ptr: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+@@ -866,6 +898,11 @@ pub const Lanes = struct {
+ 
+     fn releaseFn(ptr: *anyopaque, s: *lanes.Stream) void {
+         const self = of(ptr);
++        if (self.fill) |f| if (f.s == s) {
++            self.m.joinAhead();
++            self.m.fill_seq = &.{};
++            self.fill = null;
++        };
+         const kv = self.streams.fetchRemove(s) orelse return;
+         self.used[kv.value.slot] = false;
+     }
+@@ -947,6 +984,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 const n: usize = try r.int(u32);
+                 const replay: usize = @intCast(try r.int(u64));
+                 if (start + n > seqs[slot].items.len) return error.BadChunk;
++                if (m.fill_seq.len == 0) m.fill_seq = seqs[slot].items; // a piece after a round: the read-ahead again
+                 _ = m.fillChunk(seqs[slot].items[0 .. start + n], start, n, replay) catch |err| refused(err);
+             },
+             .verify => {
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index c37f6353..8a2079ad 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -191,6 +191,10 @@ const Host = struct {
+         h.clock = .{ .io = io };
+         h.core = lanes.Engine.init(h.gpa, &h.cfg, h.backend(), h.clock.clock());
+         errdefer h.core.deinit();
++        // TF_FILL_CHUNKS=N: a prompt pass runs N chunks at a time while other streams decode, TF_FILL_ROUNDS of their
++        // rounds between (a backend with prefill_part; unset or 0: each pass whole, the others waiting)
++        h.core.fill_chunks = envInt("TF_FILL_CHUNKS") orelse 0;
++        h.core.fill_rounds = envInt("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+@@ -215,6 +219,12 @@ const Host = struct {
+                     return x.inner.vtable.prefill(x.inner.ptr, s);
+                 }
+             }.f,
++            .prefill_part = if (v.prefill_part != null) struct {
++                fn f(p: *anyopaque, s: *lanes.Stream, chunks: usize) anyerror!bool {
++                    const x = bind(p);
++                    return x.inner.vtable.prefill_part.?(x.inner.ptr, s, chunks);
++                }
++            }.f else null,
+             .first = struct {
+                 fn f(p: *anyopaque, s: *lanes.Stream, position: u64) anyerror!u64 {
+                     const x = bind(p);
+@@ -286,6 +296,11 @@ const Host = struct {
+     }
+ };
+ 
++fn envInt(name: [*:0]const u8) ?u32 {
++    const v = std.c.getenv(name) orelse return null;
++    return std.fmt.parseInt(u32, std.mem.span(v), 10) catch null;
++}
++
+ /// The engine for `o.dir`, or null with `problem` set when no CUDA family reads the checkpoint.
+ pub fn open(a: Allocator, gpa: Allocator, io: std.Io, o: api.Open, problem: *[]const u8) !?api.Opened {
+     inline for (registry) |F| {

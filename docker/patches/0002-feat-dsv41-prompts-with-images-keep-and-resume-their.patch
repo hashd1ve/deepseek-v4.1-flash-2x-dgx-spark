@@ -1,0 +1,305 @@
+From 90750c0e68228f7c0feb883dc3ec280e9e5df801 Mon Sep 17 00:00:00 2001
+From: Manrique <125496885+hashd1ve@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 13:11:49 +0100
+Subject: [PATCH 2/4] feat(dsv41): prompts with images keep and resume their
+ prompt states, matched by the images' digests
+
+A prompt with images ran whole on every turn and kept nothing: the cache matched tokens, and an image's span is its
+placeholder token repeated, the same for every image. An agent session with a few screenshots then prefilled its whole
+history at each turn (73K tokens, ~40 s on two GB10s), and the other streams waited.
+
+The server now gives the request a cache key: the prompt's ids with each image span spelled by its image's digest (one
+id a position, past every vocabulary), and the history length past the spans. The lane host looks up, keeps and reports
+under that key, and the dsv41 lanes resume and keep prompt states whatever images the prompt holds: a state the key
+matched holds the same images' rows. A prompt with another image at the same span matches only before it.
+
+Tests: the lane host resumes a prompt with an image past it when its key matches and not when the image differs
+(fails before this change: nothing is looked up for a prompt with images); the key's ids depend on the image and the
+position and stay past the vocabulary.
+---
+ zig/src/core/engine_api.zig           |  7 ++
+ zig/src/core/lane_host.zig            |  7 +-
+ zig/src/core/lane_host_reuse_test.zig | 97 +++++++++++++++++++++++++++
+ zig/src/families/dsv41/lanes.zig      |  6 +-
+ zig/src/server/chat.zig               |  1 +
+ zig/src/server/prompt.zig             | 39 +++++++++--
+ 6 files changed, 145 insertions(+), 12 deletions(-)
+
+diff --git a/zig/src/core/engine_api.zig b/zig/src/core/engine_api.zig
+index 0d8b53cb..d9d7406f 100644
+--- a/zig/src/core/engine_api.zig
++++ b/zig/src/core/engine_api.zig
+@@ -51,6 +51,8 @@ pub const Request = struct {
+     prompt: []const u32,
+     /// The prompt's images in order, each span inside the prompt (its positions hold the image token).
+     images: []const Image = &.{},
++    /// The tokens the prompt cache matches, each image span spelled by its image's digest; empty: the prompt itself.
++    cache_key: []const u32 = &.{},
+     max_tokens: u32,
+     sampling: ?Sampling = null,
+     /// Tokens that end the reply as ``stop`` (the token is delivered); empty when the request ignores EOS.
+@@ -76,6 +78,11 @@ pub const Request = struct {
+     structure: ?Structure = null,
+     /// Stop a short exact cycle while the think block is open.
+     loop_guard: bool = false,
++
++    /// What the prompt cache matches and keeps under: `cache_key`, or the prompt when it has none.
++    pub fn cacheKey(r: *const Request) []const u32 {
++        return if (r.cache_key.len > 0) r.cache_key else r.prompt;
++    }
+ };
+ 
+ pub const Reason = enum { stop, length, cancelled, failed };
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 015239a2..e53ae631 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -79,8 +79,7 @@ pub const LaneHost = struct {
+         fn kept(ptr: *anyopaque, s: *lanes.Stream, at: u32) void {
+             const job: *Job = @ptrCast(@alignCast(ptr));
+             job.reported(); // before a keep can evict the entry the pass restored
+-            if (job.request.images.len > 0) return; // a kept state is keyed by tokens: an image's are its placeholder's
+-            if (job.host.cache) |store| _ = store.keep(job.request.prompt, at, s, job.request.chunks);
++            if (job.host.cache) |store| _ = store.keep(job.request.cacheKey(), at, s, job.request.chunks); // an image span keyed by its digest
+         }
+ 
+         /// Report a restored prefix or its failed copy; an untouched prefix remains kept.
+@@ -90,7 +89,7 @@ pub const LaneHost = struct {
+             const store = job.host.cache orelse return;
+             if (!job.started) return;
+             job.stream.reuse.saved = null; // the backend restores before its first chunk; a later keep may free it
+-            if (job.stream.reuse_failed) store.resumed(e, job.request.prompt, false) else if (job.stream.cached == e.at) store.resumed(e, job.request.prompt, true);
++            if (job.stream.reuse_failed) store.resumed(e, job.request.cacheKey(), false) else if (job.stream.cached == e.at) store.resumed(e, job.request.cacheKey(), true);
+         }
+     };
+ 
+@@ -324,7 +323,7 @@ pub const LaneHost = struct {
+         const r = job.request;
+         var reuse: lanes.stream.Reuse = .{};
+         // the entry stays alive until the backend restores it: nothing keeps between here and this stream's own pass
+-        if (r.images.len == 0) if (h.cache) |store| if (store.lookup(h.gpa, r.prompt, r.history_len, r.shared_prefixes, r.chunks)) |l| {
++        if (h.cache) |store| if (store.lookup(h.gpa, r.cacheKey(), r.history_len, r.shared_prefixes, r.chunks)) |l| {
+             job.entry = l.entry;
+             job.kept0 = store.counts.kept;
+             job.marks = l.marks;
+diff --git a/zig/src/core/lane_host_reuse_test.zig b/zig/src/core/lane_host_reuse_test.zig
+index 530e365b..060971dd 100644
+--- a/zig/src/core/lane_host_reuse_test.zig
++++ b/zig/src/core/lane_host_reuse_test.zig
+@@ -197,3 +197,100 @@ test "a turn's mark evicting the state it resumed from: the hit is reported firs
+         try history.append(gpa, t);
+     }
+ }
++
++test "a prompt with an image resumes when its image is the same, and not past the image when it differs" {
++    const gpa = std.testing.allocator;
++    var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++    defer cfg.deinit(gpa);
++    var target: lanes.fake.Fake = .{ .gpa = gpa };
++    defer target.deinit();
++    var clock: lanes.fake.FixedClock = .{};
++    var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++    defer core.deinit();
++    const Snaps = struct {
++        fn bytes(_: *anyopaque, at: u32) u64 {
++            return 64 + 4 * @as(u64, at);
++        }
++        fn save(ptr: *anyopaque, owner: ?*anyopaque, at: u32) anyerror!pc.Saved {
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            return f.save(@ptrCast(@alignCast(owner.?)), at);
++        }
++        fn restore(_: *anyopaque, _: ?*anyopaque, _: pc.Saved) anyerror!void {
++            return error.BackendRestores;
++        }
++        fn drop(ptr: *anyopaque, saved: pc.Saved) void {
++            const f: *lanes.fake.Fake = @ptrCast(@alignCast(ptr));
++            f.drop(saved);
++        }
++    };
++    var store = pc.Store.init(gpa, .{ .ptr = &target, .vtable = &.{ .bytes = Snaps.bytes, .save = Snaps.save, .restore = Snaps.restore, .drop = Snaps.drop } }, .{ .min_gap = 4, .min_prompt = 0 }, 1 << 20);
++    defer store.deinit();
++    var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++    host.cache = &store;
++    try host.start();
++    defer host.stop();
++    const Box = struct {
++        mutex: std.Io.Mutex = .init,
++        tokens: std.ArrayList(u32) = .empty,
++        cached: ?u32 = null,
++        done: ?Reason = null,
++        fn event(ctx: *anyopaque, _: Id, e: *const Event) void {
++            const b: *@This() = @ptrCast(@alignCast(ctx));
++            b.mutex.lockUncancelable(std.testing.io);
++            defer b.mutex.unlock(std.testing.io);
++            switch (e.*) {
++                .prefilled => |c| b.cached = c,
++                .tokens => |t| b.tokens.appendSlice(gpa, t) catch {},
++                .finished => |f| b.done = f.reason,
++            }
++        }
++        fn wait(b: *@This()) Reason {
++            while (true) {
++                b.mutex.lockUncancelable(std.testing.io);
++                const d = b.done;
++                b.mutex.unlock(std.testing.io);
++                if (d) |r| return r;
++                std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++            }
++        }
++    };
++    const e = host.engine();
++    const image = [_]api.Image{.{ .at = 4, .tokens = 3, .bytes = "pixels" }};
++    // an image span (positions 4 to 6, each the image token 99) that the key spells by the image's digest
++    const t1 = [_]u32{ 3, 1, 4, 1, 99, 99, 99, 5, 9, 2 };
++    const k1 = [_]u32{ 3, 1, 4, 1, 0x8000_0001, 0x8000_0002, 0x8000_0003, 5, 9, 2 };
++    var b1: Box = .{};
++    defer b1.tokens.deinit(gpa);
++    const r1: Request = .{ .prompt = &t1, .images = &image, .cache_key = &k1, .max_tokens = 6, .history_len = 8 };
++    try e.submit(1, &r1, .{ .ctx = &b1, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b1.wait());
++    try std.testing.expectEqual(@as(usize, 1), store.entries.items.len);
++    var t2: std.ArrayList(u32) = .empty; // the next turn: the history, the reply, a new user message
++    defer t2.deinit(gpa);
++    try t2.appendSlice(gpa, &t1);
++    try t2.appendSlice(gpa, b1.tokens.items[0..4]);
++    try t2.appendSlice(gpa, &.{ 7, 7, 5, 3 });
++    var k2: std.ArrayList(u32) = .empty;
++    defer k2.deinit(gpa);
++    try k2.appendSlice(gpa, &k1);
++    try k2.appendSlice(gpa, t2.items[k1.len..]);
++    var b2: Box = .{};
++    defer b2.tokens.deinit(gpa);
++    const r2: Request = .{ .prompt = t2.items, .images = &image, .cache_key = k2.items, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2) };
++    try e.submit(2, &r2, .{ .ctx = &b2, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b2.wait());
++    try std.testing.expectEqual(@as(?u32, 8), b2.cached); // the same image: resumed past it
++    // the same tokens with another image at the span: its key differs from position 4, so nothing is resumed
++    var k3: std.ArrayList(u32) = .empty;
++    defer k3.deinit(gpa);
++    try k3.appendSlice(gpa, k2.items);
++    k3.items[4] = 0x8000_0011;
++    k3.items[5] = 0x8000_0012;
++    k3.items[6] = 0x8000_0013;
++    var b3: Box = .{};
++    defer b3.tokens.deinit(gpa);
++    const r3: Request = .{ .prompt = t2.items, .images = &image, .cache_key = k3.items, .max_tokens = 4, .history_len = @intCast(t2.items.len - 2) };
++    try e.submit(3, &r3, .{ .ctx = &b3, .event = Box.event });
++    try std.testing.expectEqual(Reason.length, b3.wait());
++    try std.testing.expectEqual(@as(?u32, 0), b3.cached);
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index fdbb000a..0e1af831 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -450,8 +450,8 @@ pub const Lanes = struct {
+         var moved = false;
+         if (s.reuse.saved) |p| {
+             const sn: *Snap = @ptrCast(@alignCast(p));
+-            // (a kept state knows no images: a prompt with them runs whole and keeps nothing)
+-            if (s.images.len == 0 and self.usable(sn, len)) {
++            // (the cache matched the images before its rows by their digests: its image rows are this prompt's)
++            if (self.usable(sn, len)) {
+                 kept = sn;
+                 // in place unless the extent runs past the pool, a live stream holds it, or another kept state has
+                 // rows past the kept ones (resuming there would stale it: the rows go to a free extent instead, as
+@@ -571,7 +571,7 @@ pub const Lanes = struct {
+             }
+             head = try m.fillChunk(seq.items[0 .. start + n], start, n, replay);
+             start += n;
+-            if (s.images.len == 0) if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
++            if (s.reuse.hook) |k| if (start < len and start <= replay and (start == last_end or markEnds(s.reuse.marks, start))) k.at(k.ptr, s, @intCast(start));
+         }
+         if (!head) return error.NoPromptLogits;
+         const logits = try m.promptLogitsHost();
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index cb9edd6f..2fefa0e5 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -176,6 +176,7 @@ pub fn prepare(srv: *Server, cx: *Cx, input: Input, gone: anytype) Failure!Prepa
+     var request: api.Request = .{
+         .prompt = rendered.ids,
+         .images = rendered.images,
++        .cache_key = rendered.cache_key,
+         .max_tokens = @intCast(@min(limit, std.math.maxInt(u32))),
+         .sampling = sampling,
+         .eos = if (stops_opt.ignore_eos) &.{} else srv.eos,
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 46329fb4..605fa18c 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -10,7 +10,8 @@ const api = @import("engine_api");
+ const Value = json.Value;
+ const Cx = errors.Cx;
+ 
+-pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{} };
++/// With images, `cache_key` is what the prompt cache matches: the ids with each image span spelled by its digest.
++pub const Rendered = struct { ids: []const u32, history_len: usize = 0, images: []const api.Image = &.{}, cache_key: []const u32 = &.{} };
+ 
+ pub const isTitle = messages_mod.isTitleRequest;
+ 
+@@ -52,23 +53,26 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+         .ids => |ids| return .{ .ids = ids },
+     };
+     const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+-    if (input.images.len > 0) return spans(srv, cx, prompt, input.images); // (no kept history: the cache keys tokens)
+     const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
+     var history_len: usize = 0;
+     if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
+     if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
++    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
+     return .{ .ids = prompt, .history_len = history_len };
+ }
+ 
+ /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
+ /// the payload the engine reads), the images in prompt order.
+-fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) errors.Refused!Rendered {
++fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8) errors.Refused!Rendered {
+     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+     var out: std.ArrayList(u32) = .empty;
++    var key: std.ArrayList(u32) = .empty;
+     var placed: std.ArrayList(api.Image) = .empty;
+-    for (ids) |id| {
++    var history_extra: usize = 0;
++    for (ids, 0..) |id, i| {
+         if (id != vision.token) {
+             try out.append(cx.a, id);
++            try key.append(cx.a, id);
+             continue;
+         }
+         const k = placed.items.len;
+@@ -80,9 +84,34 @@ fn spans(srv: *Server, cx: *Cx, ids: []const u32, images: []const []const u8) er
+         };
+         try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+         try out.appendNTimes(cx.a, vision.token, prep.tokens);
++        try spellImage(cx.a, &key, prep.payload, prep.tokens);
++        if (i < history_len) history_extra += prep.tokens - 1;
+     }
+     if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+-    return .{ .ids = out.items, .images = placed.items };
++    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
++}
++
++/// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
++fn spellImage(a: std.mem.Allocator, key: *std.ArrayList(u32), payload: []const u8, tokens: u32) !void {
++    const h = std.hash.Wyhash.hash(0, payload);
++    for (0..tokens) |j| try key.append(a, 0x8000_0000 | @as(u32, @truncate((h +% @as(u64, j) *% 0x9e37_79b9_7f4a_7c15) >> 33)));
++}
++
++test "an image span's key depends on the image and the position, never on the vocabulary" {
++    const a = std.testing.allocator;
++    var one: std.ArrayList(u32) = .empty;
++    defer one.deinit(a);
++    var same: std.ArrayList(u32) = .empty;
++    defer same.deinit(a);
++    var other: std.ArrayList(u32) = .empty;
++    defer other.deinit(a);
++    try spellImage(a, &one, "the same pixels", 64);
++    try spellImage(a, &same, "the same pixels", 64);
++    try spellImage(a, &other, "other pixels", 64);
++    try std.testing.expectEqualSlices(u32, one.items, same.items);
++    try std.testing.expect(!std.mem.eql(u32, one.items, other.items));
++    for (one.items) |id| try std.testing.expect(id >= 0x8000_0000);
++    try std.testing.expect(one.items[0] != one.items[1]);
+ }
+ 
+ /// A reusable system prefix, found with a probe in place of the first user message; zero below 512 tokens.

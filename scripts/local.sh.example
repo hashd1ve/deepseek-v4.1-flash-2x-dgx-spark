@@ -1,0 +1,27 @@
+# Copy to scripts/local.sh and fill in. Addresses below are documentation placeholders.
+
+WORKER=user@192.0.2.2          # ssh target of the second Spark (key-based ssh from the head)
+HEAD_IP=192.0.2.1              # the head's address on the ConnectX-7 link
+IFACE=enp1s0f1np1              # the head's netdev on the link
+HCA=rocep1s0f1,roceP2p1s0f1    # both RoCE twins of the cabled port
+GID_INDEX=5                    # RoCE v2 GID index; check with show_gids
+
+# Optional
+# FABRIC_PEER=192.0.2.2        # copy the weights to the worker over the link instead of the ssh route
+# WORKER_IFACE=...             # when the worker's netdev or RoCE names differ from the head's
+# WORKER_HCA=...
+# DATA_DIR=/data/dsv41-1017-tf # default ~/.cache/dsv41-1017-tf, the same path on both Sparks
+# HOST=0.0.0.0                 # listen beyond localhost (set API_KEY_FILE too)
+# API_KEY_FILE=$HOME/.config/dsv41-1017-tf/api-key
+# IMAGE=...                    # use an image you built yourself instead of scripts/prepare.sh's
+# TF_MEMORY_RESERVE_GIB=4      # rank 0's CUDA reserve when the default (a tenth of the memory) leaves the weights no room
+# INPUTS_CONTEXT=65536         # a smaller window and one stream for step 5's Python start (less memory while it
+# INPUTS_PARALLEL=1            #   writes the rank caches; the caches are the same)
+# SERVE_EXTRA="--prompt-cache-gib 1"  # more arguments for every start of tensorfold-native serve
+
+# Prompt passes in pieces (docker/patches/0003, 0004): while other streams decode, a long prompt runs TF_FILL_CHUNKS
+# chunks (2048 tokens each, ~1 s) at a time with TF_FILL_ROUNDS of their rounds between, its first piece TF_FILL_FIRST
+# chunks so a turn's new tokens within it run whole. Unset: each prompt runs whole and the other streams wait for it.
+TF_FILL_CHUNKS=1
+TF_FILL_ROUNDS=4
+TF_FILL_FIRST=4

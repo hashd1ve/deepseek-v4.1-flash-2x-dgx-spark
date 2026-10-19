@@ -1,0 +1,24 @@
+deepseek-v4.1-flash-2x-dgx-spark
+Copyright 2026 hashd1ve
+
+Licensed under the Apache License, Version 2.0 (LICENSE).
+
+This repository is derived from easthambuilds' recipe
+https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold (Apache-2.0).
+start.sh, stop.sh, scripts/, tools/, docker/Dockerfile and the .gitignore come from it. Changed here:
+scripts/config.sh (the engine pin), scripts/common.sh (the image hash covers docker/patches/, rank 0's TF_FILL_*
+settings), scripts/prepare.sh (model/chat_template.jinja put in place), scripts/local.sh.example (the TF_FILL_*
+settings) and docker/Dockerfile (docker/patches/ applied to the Zig engine). README.md is new; it reuses parts of
+the recipe's README.
+
+docker/patches/ are changes to Bertholomus AI's TensorFold fork, branch deepseek-v41-zig
+(https://github.com/bertholomus/TensorFold, Apache-2.0), itself a fork of TensorFold
+(https://github.com/ashhart/TensorFold, Apache-2.0). They are proposed upstream as bertholomus/TensorFold #25, #28
+and #29.
+
+model/chat_template.jinja is the template the checkpoint easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw carries,
+written by Mia's AI Lab as a port of DeepSeek's encoding/encoding.py (DeepSeek, MIT), with one change: each piece of
+the prompt is written out as it is made instead of being added to one growing string.
+
+The model weights (DeepSeek, MIT), the checkpoint, the engine, the kernel kit and NVIDIA's PyTorch container keep
+their own licenses and terms; none of them is redistributed here.
