@@ -113,6 +113,45 @@ dropped. The engine's server tests (70 + 33 + 17) and its parity goldens pass. O
 runs as 159 and 163 argument deltas spread over the 7 and 12 s it took to write, each the same call as the
 unstreamed reply; the other checks in [`tests/`](../tests) gave the same results as before the patch.
 
+## 7. A session with screenshots got the server stopped
+
+**Symptom.** An OpenCode session at 218K tokens stopped answering: our memory watchdog had stopped rank 0 (2.8 GiB
+free, 0.78 GiB of page cache left, no memory pressure yet), and rank 1 went down with it. Nothing started it again,
+so the client waited on a dead server.
+
+**Cause.** Rank 0 used 3.6 GiB between requests and up to +1.25 GiB during each one, held for as long as its reply
+ran. That afternoon, a session of the same length without images peaked at +0.45 GiB. Three things added up:
+- the tokenizer ran every step of every word in one arena, ~800 bytes a token, and the server tokenizes the prompt
+  twice (with and without the generation prompt);
+- OpenCode sends every screenshot of the conversation on every turn (30 in that session), and the server decoded each
+  one again: ~30 MiB allocated and ~35 ms for a 1280x633 PNG;
+- each prompt pass ran the vision tower on every image and sent their rows to rank 1, also for the images its kept
+  state already held.
+
+**Fix.** [`docker/patches/0006`-`0008`](../docker/patches), ours:
+- the tokenizer resets its scratch for each added-token segment and each word: 229 MiB → 5.6 MiB for a 296K-token
+  prompt, the same ids over 24.5M tokens of random and real text;
+- the server renders the prompt and prepares its images in scratch freed before the reply, so the request keeps its
+  ids, cache key and payloads;
+- a PNG is decoded the first time it comes, which still refuses a bad one, and later sized from its header. Its
+  payload carries the file, decoded only when a prompt pass reads its span, and the pass runs the tower only for
+  spans past the kept state it resumes from.
+
+Each change has a test that fails without it. On the same synthetic session (`tests/agent_session.py 218 30 8`:
+~195K tokens, 30-32 screenshots, 8 turns of a tool call and its result each):
+
+| per turn, after the session is built | before | after |
+| --- | ---: | ---: |
+| rank 0's peak over its idle RSS | +1.3 GiB | +43 MiB |
+| lowest MemFree on the head | 2.6–3.5 GiB | 4.4–4.6 GiB |
+| seconds to the reply (200 tokens) | 13.4–19.4 | 3.0–8.0 |
+
+The greedy replies, the template's ids, tool calls, image replies, resumed prompts and decode speed are unchanged
+(the checks in [`tests/`](../tests)). A `/tokenize` of 296K tokens peaks at +44 MiB instead of +235.
+
+**Down anyway.** [`ops/keep_serving.sh`](../ops/keep_serving.sh) runs `./start.sh restart` when a rank goes down without
+`./stop.sh`, at most 3 times in 2 hours. Stopping rank 0 by hand, as the watchdog does, gave a 67-second outage.
+
 ## Also found
 
 - **The prompt cache restored states exactly.** We checked this when the model answered in Chinese mid-session (a

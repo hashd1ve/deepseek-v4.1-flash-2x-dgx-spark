@@ -4,6 +4,7 @@
 . "$(dirname "$0")/scripts/common.sh"
 RESTART=0
 [ "${1:-}" = restart ] && { RESTART=1; shift; }
+rm -f "$DATA_DIR/.stopped"  # (stop.sh's mark: ops/keep_serving.sh may start it again when it goes down)
 
 step "Setup"
 if [ "$(cat "$DATA_DIR/.prepared" 2>/dev/null | cut -d' ' -f1)" = "$IMAGE" ]; then

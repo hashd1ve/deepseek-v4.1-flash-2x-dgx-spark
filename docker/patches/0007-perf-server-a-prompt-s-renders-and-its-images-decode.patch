@@ -1,0 +1,271 @@
+From 1be13f78a3ccbeebd11d4c2f390bbd21605852b5 Mon Sep 17 00:00:00 2001
+From: Manrique <125496885+hashd1ve@users.noreply.github.com>
+Date: Mon, 19 Oct 2026 22:37:58 +0100
+Subject: [PATCH 7/8] perf(server): a prompt's renders and its images' decodes
+ run in scratch freed before the reply
+
+prepare rendered the conversation twice (with and without the generation prompt) and prepared each image in the request's arena, which nothing returns before the request ends: the template's values, the text and the tokenizer's scratch of two renders, and each picture's pixels and patches, stayed for as long as the reply ran. Both renders now run in an arena freed when prepare returns, each image in one reset for the next, and the request keeps the ids, the cache key and the payloads, the lists at their final length. On the scripted server, a 296K-token OpenCode-shaped request peaks at +70 MiB instead of +530-600.
+---
+ zig/src/server/prompt.zig             |  81 +++++++++++-----
+ zig/src/server/prompt_memory_test.zig | 132 ++++++++++++++++++++++++++
+ zig/src/server/root.zig               |   1 +
+ 3 files changed, 189 insertions(+), 25 deletions(-)
+ create mode 100644 zig/src/server/prompt_memory_test.zig
+
+diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
+index 605fa18c..eaf80e40 100644
+--- a/zig/src/server/prompt.zig
++++ b/zig/src/server/prompt.zig
+@@ -52,43 +52,74 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
+         } },
+         .ids => |ids| return .{ .ids = ids },
+     };
+-    const prompt = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, true);
+-    const history = try renderIds(srv, cx, input.messages, input.tools, thinking, effort, false);
++    // both renders in a scratch arena freed here: the request keeps only the ids for as long as its reply runs, not
++    // the template's values and the text of two renders of the whole conversation
++    var arena: std.heap.ArenaAllocator = .init(srv.gpa);
++    defer arena.deinit();
++    var scratch: Cx = .{ .a = arena.allocator() };
++    const rendered = renderIds(srv, &scratch, input.messages, input.tools, thinking, effort, true) catch |e| return carry(cx, &scratch, e);
++    const history = renderIds(srv, &scratch, input.messages, input.tools, thinking, effort, false) catch |e| return carry(cx, &scratch, e);
+     var history_len: usize = 0;
+-    if (history.len > 0 and history.len < prompt.len and std.mem.eql(u32, prompt[0..history.len], history)) history_len = history.len;
+-    if (history_len == 0 and prompt.len > 1 and std.mem.eql(u32, history, prompt)) history_len = prompt.len - 1; // a template with no generation suffix
+-    if (input.images.len > 0) return spans(srv, cx, prompt, history_len, input.images);
+-    return .{ .ids = prompt, .history_len = history_len };
++    if (history.len > 0 and history.len < rendered.len and std.mem.eql(u32, rendered[0..history.len], history)) history_len = history.len;
++    if (history_len == 0 and rendered.len > 1 and std.mem.eql(u32, history, rendered)) history_len = rendered.len - 1; // a template with no generation suffix
++    if (input.images.len > 0) return spans(srv, cx, rendered, history_len, input.images);
++    return .{ .ids = try cx.a.dupe(u32, rendered), .history_len = history_len };
++}
++
++/// A refusal from a scratch context, its message moved to the request's allocator before the scratch is freed.
++fn carry(cx: *Cx, scratch: *const Cx, e: errors.Refused) errors.Refused {
++    if (e == error.Refused) {
++        cx.kind = scratch.kind;
++        cx.message = try cx.a.dupe(u8, scratch.message);
++    }
++    return e;
+ }
+ 
+ /// Each image placeholder of the rendered prompt as its image's span (the vision family's prepare: the span's length and
+-/// the payload the engine reads), the images in prompt order.
++/// the payload the engine reads), the images in prompt order. Each prepare runs in a scratch arena reset for the next
++/// image (a decode's pixels and patches are tens of MB): the request keeps only the payloads, and the ids and key at
++/// their final length.
+ fn spans(srv: *Server, cx: *Cx, ids: []const u32, history_len: usize, images: []const []const u8) errors.Refused!Rendered {
+     const vision = srv.info.vision orelse return cx.refuse("this server accepts text only; image, audio and video inputs are unsupported");
+-    var out: std.ArrayList(u32) = .empty;
+-    var key: std.ArrayList(u32) = .empty;
+-    var placed: std.ArrayList(api.Image) = .empty;
++    const holders = std.mem.count(u32, ids, &.{vision.token});
++    const placed = try cx.a.alloc(api.Image, @min(holders, images.len));
++    var total = ids.len;
++    {
++        var arena: std.heap.ArenaAllocator = .init(srv.gpa);
++        defer arena.deinit();
++        for (placed, images[0..placed.len]) |*p, bytes| {
++            _ = arena.reset(.retain_capacity);
++            var problem: []const u8 = "";
++            const prep = vision.prepare(vision.ctx, arena.allocator(), bytes, &problem) catch |e| switch (e) {
++                error.OutOfMemory => return error.OutOfMemory,
++                error.BadImage => return cx.refuse(try cx.a.dupe(u8, problem)),
++            };
++            const payload = try cx.a.alignedAlloc(u8, .@"16", prep.payload.len);
++            @memcpy(payload, prep.payload);
++            p.* = .{ .at = 0, .tokens = prep.tokens, .bytes = payload };
++            total += prep.tokens - 1;
++        }
++    }
++    if (holders > images.len) return cx.refuse("image input: the prompt holds more image placeholders than images");
++    if (holders < images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
++    var out: std.ArrayList(u32) = try .initCapacity(cx.a, total);
++    var key: std.ArrayList(u32) = try .initCapacity(cx.a, total);
+     var history_extra: usize = 0;
++    var k: usize = 0;
+     for (ids, 0..) |id, i| {
+         if (id != vision.token) {
+-            try out.append(cx.a, id);
+-            try key.append(cx.a, id);
++            out.appendAssumeCapacity(id);
++            key.appendAssumeCapacity(id);
+             continue;
+         }
+-        const k = placed.items.len;
+-        if (k >= images.len) return cx.refuse("image input: the prompt holds more image placeholders than images");
+-        var problem: []const u8 = "";
+-        const prep = vision.prepare(vision.ctx, cx.a, images[k], &problem) catch |e| switch (e) {
+-            error.OutOfMemory => return error.OutOfMemory,
+-            error.BadImage => return cx.refuse(problem),
+-        };
+-        try placed.append(cx.a, .{ .at = @intCast(out.items.len), .tokens = prep.tokens, .bytes = prep.payload });
+-        try out.appendNTimes(cx.a, vision.token, prep.tokens);
+-        try spellImage(cx.a, &key, prep.payload, prep.tokens);
+-        if (i < history_len) history_extra += prep.tokens - 1;
++        const p = &placed[k];
++        k += 1;
++        p.at = @intCast(out.items.len);
++        out.appendNTimesAssumeCapacity(vision.token, p.tokens);
++        try spellImage(cx.a, &key, p.bytes, p.tokens);
++        if (i < history_len) history_extra += p.tokens - 1;
+     }
+-    if (placed.items.len != images.len) return cx.refuse("image input: the prompt holds fewer image placeholders than images");
+-    return .{ .ids = out.items, .images = placed.items, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
++    return .{ .ids = out.items, .images = placed, .cache_key = key.items, .history_len = if (history_len > 0) history_len + history_extra else 0 };
+ }
+ 
+ /// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
+diff --git a/zig/src/server/prompt_memory_test.zig b/zig/src/server/prompt_memory_test.zig
+new file mode 100644
+index 00000000..d4fc7c91
+--- /dev/null
++++ b/zig/src/server/prompt_memory_test.zig
+@@ -0,0 +1,132 @@
++//! A request keeps its prompt's ids, not the scratch of rendering, encoding and preparing its images: the reply can run
++//! for minutes, and a long conversation's renders (two of them) or a few dozen screenshots' pixels held all that time
++//! once took a GiB a request.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const model_text = @import("model_text.zig");
++const prompt = @import("prompt.zig");
++const chat = @import("chat.zig");
++
++/// Each byte its id, the image placeholder (\x01) included; rendering and encoding leave 64 bytes of scratch a byte.
++const Wasteful = struct {
++    fn text(t: *@This()) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource } };
++    }
++
++    fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        _ = try a.alloc(u8, 64 * input.len);
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++
++    fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
++        const decoded = try a.alloc(u8, ids.len);
++        for (ids, decoded) |id, *byte| byte.* = @intCast(id);
++        return decoded;
++    }
++
++    fn tokenId(_: *anyopaque, _: []const u8) ?u32 {
++        return null;
++    }
++
++    fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
++        return std.fmt.allocPrint(a, "{d}", .{id});
++    }
++
++    fn vocabSize(_: *anyopaque) u32 {
++        return 256;
++    }
++
++    fn eosIds(_: *anyopaque) []const u32 {
++        return &.{};
++    }
++
++    fn render(_: *anyopaque, a: std.mem.Allocator, messages: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error![]u8 {
++        var out: std.ArrayList(u8) = .empty;
++        if (messages != .array) return out.items;
++        for (messages.array) |m| {
++            const content = textOf(m, "content");
++            _ = try a.alloc(u8, 64 * content.len);
++            try out.print(a, "[{s}]{s}\n", .{ textOf(m, "role"), content });
++        }
++        return out.items;
++    }
++
++    fn templateSource(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++fn textOf(v: json.Value, key: []const u8) []const u8 {
++    const x = v.get(key) orelse return "";
++    return if (x == .string) x.string else "";
++}
++
++/// An engine with vision whose prepare leaves 4 MiB of pixels behind for each image and gives a 64-byte payload.
++const Seeing = struct {
++    fn engine(e: *@This()) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++
++    fn info(ctx: *anyopaque) api.Info {
++        return .{ .vision = .{ .ctx = ctx, .placeholder = "\x01", .token = 1, .prepare = prepare } };
++    }
++
++    fn prepare(_: *anyopaque, a: std.mem.Allocator, bytes: []const u8, _: *[]const u8) api.Vision.PrepareError!api.Vision.Prepared {
++        _ = try a.alloc(u8, 4 << 20);
++        const payload = try a.alloc(u8, 64);
++        @memset(payload, bytes[0]);
++        return .{ .tokens = 4, .payload = payload };
++    }
++
++    fn submit(_: *anyopaque, _: api.Id, _: *const api.Request, _: api.Sink) api.SubmitError!void {
++        return error.Closed;
++    }
++
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++test "a prepared prompt keeps its ids and image payloads, not its renders' or its images' scratch" {
++    const gpa = std.testing.allocator;
++    var text: Wasteful = .{};
++    var engine: Seeing = .{};
++    var srv = try server.Server.init(gpa, std.testing.io, engine.engine(), text.text(), .{ .served_name = "m", .model_ids = &.{"m"}, .enable_thinking = false, .use_drafts = false }, null);
++    defer srv.deinit();
++    var body: std.ArrayList(u8) = .empty;
++    defer body.deinit(gpa);
++    try body.appendSlice(gpa, "[");
++    const images = 12;
++    for (0..200) |i| {
++        if (i > 0) try body.appendSlice(gpa, ",");
++        try body.print(gpa, "{{\"role\": \"{s}\", \"content\": \"", .{if (i % 2 == 0) "user" else "assistant"});
++        for (0..1000) |_| try body.append(gpa, 'x');
++        if (i % 2 == 0 and i / 2 < images) try body.appendSlice(gpa, "\\u0001");
++        try body.appendSlice(gpa, "\"}");
++    }
++    try body.appendSlice(gpa, "]");
++    var request: std.heap.ArenaAllocator = .init(gpa); // a request's allocator: nothing comes back before it ends
++    defer request.deinit();
++    const messages = (try json.parse(request.allocator(), body.items)).ok;
++    var bytes: [images][]const u8 = undefined;
++    for (&bytes, 0..) |*b, i| b.* = try std.fmt.allocPrint(request.allocator(), "{c}", .{@as(u8, @intCast('a' + i))});
++    const before = request.queryCapacity();
++    var cx: server.errors.Cx = .{ .a = request.allocator() };
++    const rendered = try prompt.prepare(srv, &cx, .{ .messages = messages, .fields = .null, .images = &bytes }, false, null);
++    try std.testing.expectEqual(@as(usize, images), rendered.images.len);
++    try std.testing.expectEqual(@as(u8, 'c'), rendered.images[2].bytes[0]);
++    try std.testing.expect(rendered.ids.len > 200_000);
++    // the ids, the cache key and the payloads, a few bytes a token: two renders' and twelve pictures' scratch, kept, are
++    // 64 bytes a token and 48 MiB
++    try std.testing.expect(request.queryCapacity() - before < 24 * rendered.ids.len);
++}
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index 7efe9b4e..e8b0a381 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -37,6 +37,7 @@ test {
+     _ = @import("messages.zig");
+     _ = @import("stream_preflight_test.zig");
+     _ = @import("late_system_test.zig");
++    _ = @import("prompt_memory_test.zig");
+     _ = @import("effort_values_test.zig");
+     _ = @import("compact_test.zig");
+     _ = @import("decisions.zig");
+-- 
+2.51.1
+

@@ -11,10 +11,10 @@ It starts from [easthambuilds' recipe](https://github.com/easthambuilds/DeepSeek
 
 | | |
 | --- | --- |
-| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `629c524a`, which includes two of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#26](https://github.com/bertholomus/TensorFold/pull/26)), plus [`docker/patches/`](docker/patches): [#25](https://github.com/bertholomus/TensorFold/pull/25), [#28](https://github.com/bertholomus/TensorFold/pull/28) (merged after this pin), [#29](https://github.com/bertholomus/TensorFold/pull/29) and tool calls streamed as they are written (`0005`) |
+| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `629c524a`, which includes two of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#26](https://github.com/bertholomus/TensorFold/pull/26)), plus [`docker/patches/`](docker/patches): [#25](https://github.com/bertholomus/TensorFold/pull/25), [#28](https://github.com/bertholomus/TensorFold/pull/28) (merged after this pin), [#29](https://github.com/bertholomus/TensorFold/pull/29), tool calls streamed as they are written (`0005`) and a request's memory held to its prompt (`0006`-`0008`) |
 | Chat template | [`model/chat_template.jinja`](model/chat_template.jinja): the published template, rendering the same prompt without rank 0's memory growing with the conversation |
 | Recipe | easthambuilds' scripts with the changes from [easthambuilds#1](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold/pull/1) (the 512/513-token kit variant, kept rank caches, a CDI preflight, settings for a tight memory budget) and prompt passes in pieces |
-| Operations | [`ops/`](ops): the kernel memory settings and the memory watchdog we serve with |
+| Operations | [`ops/`](ops): the kernel memory settings, the memory watchdog and a supervisor that starts the server again when it goes down on its own |
 | Checks | [`tests/`](tests): the checks behind every number below |
 
 ## What changed, and why
@@ -42,6 +42,11 @@ details.
 - **A long tool call looked like a hang.** The engine held a DSML calls block until the reply ended, so while the model
   wrote a long call the client saw nothing: ~4 min still on one token in one of our sessions. `docker/patches/0005`
   streams each call's name as soon as it is written and its arguments as they come, as OpenAI-compatible servers do.
+- **A session with screenshots got the server stopped by its own memory watchdog.** Each request cost rank 0
+  +1.3 GiB at ~200K tokens with 30 screenshots (the client sends them all again on every turn): the tokenizer kept
+  ~800 bytes a token, every screenshot was decoded again, the vision tower ran on all of them, and all of it stayed
+  until the reply ended. `0006`-`0008` bring that to +43 MiB, with the same tokens and replies, and make each such turn
+  ~10 s faster. When a rank goes down anyway, [`ops/keep_serving.sh`](ops/keep_serving.sh) starts the server again.
 
 ## Results
 
@@ -94,7 +99,12 @@ curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application
 
 ./start.sh restart        # restart both ranks (extra arguments go to tensorfold-native serve)
 ./stop.sh                 # stop both ranks; their logs are saved under DATA_DIR/logs
+nohup ops/keep_serving.sh > /dev/null 2>&1 &   # optional: start it again when a rank dies (see below)
 ```
+
+`ops/keep_serving.sh` starts the server again when a rank goes down without `./stop.sh` (a crash, or
+`ops/memory_watchdog.sh` stopping it), at most 3 times in 2 hours; its log is `DATA_DIR/keep_serving.log`. With it
+running, stop the server with `./stop.sh`, never with `docker stop`.
 
 The model thinks before it answers (`reasoning_content`), so give replies enough `max_tokens`. The server listens on
 `127.0.0.1` by default; set `HOST=0.0.0.0` together with `API_KEY_FILE` to serve the network. Images: OpenAI-style
