@@ -1,8 +1,8 @@
-From 1be13f78a3ccbeebd11d4c2f390bbd21605852b5 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manrique <125496885+hashd1ve@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 22:37:58 +0100
-Subject: [PATCH 7/8] perf(server): a prompt's renders and its images' decodes
- run in scratch freed before the reply
+Subject: [PATCH] perf(server): a prompt's renders and its images' decodes run
+ in scratch freed before the reply
 
 prepare rendered the conversation twice (with and without the generation prompt) and prepared each image in the request's arena, which nothing returns before the request ends: the template's values, the text and the tokenizer's scratch of two renders, and each picture's pixels and patches, stayed for as long as the reply ran. Both renders now run in an arena freed when prepare returns, each image in one reset for the next, and the request keeps the ids, the cache key and the payloads, the lists at their final length. On the scripted server, a 296K-token OpenCode-shaped request peaks at +70 MiB instead of +530-600.
 ---
@@ -13,7 +13,7 @@ prepare rendered the conversation twice (with and without the generation prompt)
  create mode 100644 zig/src/server/prompt_memory_test.zig
 
 diff --git a/zig/src/server/prompt.zig b/zig/src/server/prompt.zig
-index 605fa18c..eaf80e40 100644
+index 605fa18..eaf80e4 100644
 --- a/zig/src/server/prompt.zig
 +++ b/zig/src/server/prompt.zig
 @@ -52,43 +52,74 @@ pub fn prepare(srv: *Server, cx: *Cx, input: chat.Input, thinking: bool, effort:
@@ -118,7 +118,7 @@ index 605fa18c..eaf80e40 100644
  /// An image span as the cache key spells it: ids past every vocabulary's, one a position, from the payload's digest.
 diff --git a/zig/src/server/prompt_memory_test.zig b/zig/src/server/prompt_memory_test.zig
 new file mode 100644
-index 00000000..d4fc7c91
+index 0000000..d4fc7c9
 --- /dev/null
 +++ b/zig/src/server/prompt_memory_test.zig
 @@ -0,0 +1,132 @@
@@ -255,7 +255,7 @@ index 00000000..d4fc7c91
 +    try std.testing.expect(request.queryCapacity() - before < 24 * rendered.ids.len);
 +}
 diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
-index 7efe9b4e..e8b0a381 100644
+index 7efe9b4..e8b0a38 100644
 --- a/zig/src/server/root.zig
 +++ b/zig/src/server/root.zig
 @@ -37,6 +37,7 @@ test {
@@ -267,5 +267,5 @@ index 7efe9b4e..e8b0a381 100644
      _ = @import("compact_test.zig");
      _ = @import("decisions.zig");
 -- 
-2.51.1
+2.54.0 (Apple Git-157)
 

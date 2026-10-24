@@ -1,8 +1,8 @@
-From 197d9ef1a722d3e18150a3f4141bf43d551f3380 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manrique <125496885+hashd1ve@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 22:37:58 +0100
-Subject: [PATCH 8/8] perf(dsv41): a PNG is decoded when a prompt pass reads
- its span, and the tower skips spans a kept state holds
+Subject: [PATCH] perf(dsv41): a PNG is decoded when a prompt pass reads its
+ span, and the tower skips spans a kept state holds
 
 A client such as OpenCode sends every screenshot of a conversation again on each turn. Each request decoded and patched all of them on its thread (~35 ms and ~30 MiB allocated for a 1280x633 screenshot, all of it kept by the request; 30 of them in one session), and each prompt pass ran the tower on all of them and sent their rows to rank 1, though the pass resumed past them. A PNG is now decoded the first time it comes (a bad one is refused as before), then sized from its header; its payload carries the file, which Vision.rows decodes when a pass needs the span. fillOpen keeps every span's positions dead for Engram but reads rows only for spans that end past the kept state it resumes.
 ---
@@ -11,10 +11,10 @@ A client such as OpenCode sends every screenshot of a conversation again on each
  2 files changed, 71 insertions(+), 10 deletions(-)
 
 diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
-index df73c0c6..d59fe2e3 100644
+index 5b0cc49..d3d3090 100644
 --- a/zig/src/families/dsv41/lanes.zig
 +++ b/zig/src/families/dsv41/lanes.zig
-@@ -540,7 +540,10 @@ pub const Lanes = struct {
+@@ -544,7 +544,10 @@ pub const Lanes = struct {
          try seq.resize(gpa, len);
          for (seq.items, ids) |*q, id| q.* = @intCast(id);
          // images: each span's positions dead in the sequence (negative: no Engram n-gram reaches into or across one),
@@ -26,7 +26,7 @@ index df73c0c6..d59fe2e3 100644
          var spans: std.ArrayList(@import("prompt.zig").Span) = .empty;
          defer spans.deinit(gpa);
          var rows: std.ArrayList(u8) = .empty;
-@@ -555,6 +558,7 @@ pub const Lanes = struct {
+@@ -559,6 +562,7 @@ pub const Lanes = struct {
                      if (q.* != @as(i64, image_id)) return error.BadImageSpan;
                      q.* = -1;
                  }
@@ -35,7 +35,7 @@ index df73c0c6..d59fe2e3 100644
                      if (img.bytes.len != img.tokens * row_bytes) return error.BadImageRows;
                      try rows.appendSlice(gpa, img.bytes);
 diff --git a/zig/src/families/dsv41/vision.zig b/zig/src/families/dsv41/vision.zig
-index ea82917d..2aebcd71 100644
+index ea82917..2aebcd7 100644
 --- a/zig/src/families/dsv41/vision.zig
 +++ b/zig/src/families/dsv41/vision.zig
 @@ -12,20 +12,29 @@ const model = @import("model.zig");
@@ -178,5 +178,5 @@ index ea82917d..2aebcd71 100644
          try v.tower.spanRows(g, at, v.span.ptr, v.scratch.ptr);
          const t = g.spanTokens();
 -- 
-2.51.1
+2.54.0 (Apple Git-157)
 

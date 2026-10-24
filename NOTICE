@@ -8,14 +8,16 @@ https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-Ten
 start.sh, stop.sh, scripts/, tools/, docker/Dockerfile and the .gitignore come from it. Changed here: start.sh and
 stop.sh (stop.sh's mark for ops/keep_serving.sh),
 scripts/config.sh (the engine pin), scripts/common.sh (the image hash covers docker/patches/, rank 0's TF_FILL_*
-settings), scripts/prepare.sh (model/chat_template.jinja put in place), scripts/local.sh.example (the TF_FILL_*
-settings) and docker/Dockerfile (docker/patches/ applied to the Zig engine). README.md is new; it reuses parts of
+settings, ENGINE_ENV for both ranks, the containers' log rotation), scripts/prepare.sh (model/chat_template.jinja put in place), scripts/local.sh.example (the TF_FILL_*
+settings and ENGINE_ENV) and docker/Dockerfile (docker/patches/ applied to the Zig engine). README.md is new; it reuses parts of
 the recipe's README.
 
 docker/patches/ are changes to Bertholomus AI's TensorFold fork, branch deepseek-v41-zig
 (https://github.com/bertholomus/TensorFold, Apache-2.0), itself a fork of TensorFold
-(https://github.com/ashhart/TensorFold, Apache-2.0). 0001 is bertholomus/TensorFold #25; 0005-0008
-are ours and not proposed upstream yet.
+(https://github.com/ashhart/TensorFold, Apache-2.0). 0005-0008 are ours and not proposed upstream yet. 0009 is by
+Coinupbtc, from MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks (zig/patches/0027-tool-call-prose.patch, Apache-2.0).
+0010 is bertholomus/TensorFold #36 by Blackwellboy. 0011 and 0012 are ashhart's commits 23b943cb and cf6541ad on
+TensorFold's main (#1180); 0013 is ours (their test fitted to this branch).
 
 model/chat_template.jinja is the template the checkpoint easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw carries,
 written by Mia's AI Lab as a port of DeepSeek's encoding/encoding.py (DeepSeek, MIT), with one change: each piece of

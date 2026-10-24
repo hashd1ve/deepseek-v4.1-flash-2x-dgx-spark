@@ -33,6 +33,7 @@ IMAGE=${IMAGE:-dsv41-1017-tf:$PIN_HASH}
 # docker run options both ranks share; $1 data dir, $2 netdev, $3 RoCE devices
 run_opts() {
   echo "--gpus all --network host --ipc host --ulimit memlock=-1 --ulimit stack=67108864 --cap-add IPC_LOCK" \
+    "--log-opt max-size=100m --log-opt max-file=3 ${ENGINE_ENV:-}" \
     "--device /dev/infiniband -v $1/model:/model:ro -v $1/engram:/engram:ro -v $1/kit:/kit:ro -v $1/cache:/cache" \
     "-e NCCL_IB_HCA=$3 -e NCCL_IB_GID_INDEX=$GID_INDEX -e NCCL_SOCKET_IFNAME=$2 -e TF_RDMA_GID_INDEX=$GID_INDEX"
 }

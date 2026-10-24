@@ -1,4 +1,4 @@
-From 7c00a56c2009b5233ce2a4b6fff717a359d12160 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: hashd1ve <125496885+hashd1ve@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 17:29:01 +0100
 Subject: [PATCH] feat(server): DeepSeek-V4.1's DSML calls stream their
@@ -19,10 +19,10 @@ streamed XML call does.
  3 files changed, 254 insertions(+), 18 deletions(-)
 
 diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
-index 2fefa0e5..64b25efc 100644
+index 2e78a2a..493b02c 100644
 --- a/zig/src/server/chat.zig
 +++ b/zig/src/server/chat.zig
-@@ -402,6 +402,7 @@ const Generation = struct {
+@@ -405,6 +405,7 @@ const Generation = struct {
          if (g.calls) |*c| {
              var out: std.ArrayList(Value) = .empty;
              try c.feed(tool_parse.beforeDsml(answer), &out); // never the reasoning, nor a DSML block's arguments: a call they quote is not made
@@ -31,7 +31,7 @@ index 2fefa0e5..64b25efc 100644
          }
      }
 diff --git a/zig/src/server/tool_parse.zig b/zig/src/server/tool_parse.zig
-index 5e1d358e..abd221a1 100644
+index 5e1d358..abd221a 100644
 --- a/zig/src/server/tool_parse.zig
 +++ b/zig/src/server/tool_parse.zig
 @@ -28,12 +28,12 @@ const param_open = "<\u{ff5c}DSML\u{ff5c}parameter name=\"";
@@ -54,7 +54,7 @@ index 5e1d358e..abd221a1 100644
  fn findCI(hay: []const u8, needle: []const u8, from: usize) ?usize {
      if (from > hay.len) return null;
 diff --git a/zig/src/server/tool_stream.zig b/zig/src/server/tool_stream.zig
-index a02ee06d..e6ddf9b0 100644
+index a02ee06..e6ddf9b 100644
 --- a/zig/src/server/tool_stream.zig
 +++ b/zig/src/server/tool_stream.zig
 @@ -1,4 +1,4 @@
@@ -353,5 +353,5 @@ index a02ee06d..e6ddf9b0 100644
 +    try std.testing.expectEqualStrings(parsed[1].get("function").?.get("arguments").?.string, got[1][1]);
 +}
 -- 
-2.51.1
+2.54.0 (Apple Git-157)
 

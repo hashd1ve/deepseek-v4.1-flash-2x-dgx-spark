@@ -11,7 +11,7 @@ It starts from [easthambuilds' recipe](https://github.com/easthambuilds/DeepSeek
 
 | | |
 | --- | --- |
-| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `45c25b1b`, which includes four of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#26](https://github.com/bertholomus/TensorFold/pull/26), [#28](https://github.com/bertholomus/TensorFold/pull/28), [#29](https://github.com/bertholomus/TensorFold/pull/29)), plus [`docker/patches/`](docker/patches): [#25](https://github.com/bertholomus/TensorFold/pull/25) (`0001`), tool calls streamed as they are written (`0005`) and a request's memory held to its prompt (`0006`-`0008`) |
+| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `2aa3c47d`, which includes five of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#25](https://github.com/bertholomus/TensorFold/pull/25), [#26](https://github.com/bertholomus/TensorFold/pull/26), [#28](https://github.com/bertholomus/TensorFold/pull/28), [#29](https://github.com/bertholomus/TensorFold/pull/29)), plus [`docker/patches/`](docker/patches): tool calls streamed as they are written (`0005`), a request's memory held to its prompt (`0006`-`0008`), the text before tool calls kept as the content (`0009`, from Mia's AI Lab's recipe), quoted control tokens kept as text (`0010`, [#36](https://github.com/bertholomus/TensorFold/pull/36)) and the reasoning ended at the model's own close token (`0011`-`0013`, from TensorFold's main) |
 | Chat template | [`model/chat_template.jinja`](model/chat_template.jinja): the published template, rendering the same prompt without rank 0's memory growing with the conversation |
 | Recipe | easthambuilds' scripts with the changes from [easthambuilds#1](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold/pull/1) (the 512/513-token kit variant, kept rank caches, a CDI preflight, settings for a tight memory budget) and prompt passes in pieces |
 | Operations | [`ops/`](ops): the kernel memory settings, the memory watchdog and a supervisor that starts the server again when it goes down on its own |
@@ -47,6 +47,27 @@ details.
   ~800 bytes a token, every screenshot was decoded again, the vision tower ran on all of them, and all of it stayed
   until the reply ended. `0006`-`0008` bring that to +43 MiB, with the same tokens and replies, and make each such turn
   ~10 s faster. When a rank goes down anyway, [`ops/keep_serving.sh`](ops/keep_serving.sh) starts the server again.
+- **The text a reply wrote before its tool calls was lost.** Without streaming the server returned `"content": null`
+  whenever a reply made calls; streamed, the calls' two newlines came as content, so the next turn stopped matching
+  the generated tokens right before the calls. `0009` (by [Coinupbtc](https://github.com/Coinupbtc), from
+  [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks), its `0027`) keeps the
+  text as the content, as DeepSeek's reference parser reads it.
+- **A control token quoted in a file or a web page reached the model as the token.** An agent that read `</think>`,
+  `<｜User｜>` or a DSML block gave the model the end of its reasoning, a new turn or a call. `0010`
+  ([#36](https://github.com/bertholomus/TensorFold/pull/36) by [Blackwellboy](https://github.com/Blackwellboy), not
+  merged yet) keeps what a chat request quotes as text; the template's own tokens are unchanged.
+- **A short prompt that shared another conversation's prefix ran from 0**, and the other conversation lost that state,
+  when it ended less than 128 tokens past one of the other's chunk ends (a subagent, typically). Fixed upstream in
+  [#35](https://github.com/bertholomus/TensorFold/pull/35) by [kky42](https://github.com/kky42); in our check the
+  prompt now resumes at 4,096 (0 before).
+- **A `</think>` the model wrote while reasoning ended its reasoning there.** The rest of the reasoning came as the
+  answer. `0011`-`0012` ([ashhart](https://github.com/ashhart)'s fix for TensorFold
+  [#1180](https://github.com/ashhart/TensorFold/issues/1180), on TensorFold's main since 1.1.4) end it at the model's
+  own close token; `0013` fits their test to this branch. `tests/think_quote.py`: the reasoning keeps the quoted tag
+  and the answer is the answer, whole and streamed (both failed before).
+- **Prompts ~3 % faster** with `TF_DS_ENGRAM_LEAD=1` ([#41](https://github.com/bertholomus/TensorFold/pull/41) by
+  Blackwellboy, opt-in upstream), on in `scripts/local.sh.example`: 2,031–2,047 tok/s against 1,961–1,995 without it
+  (a 50K-token prompt, 5 runs right after a start, both builds), the same replies and the same decode.
 
 ## Results
 
@@ -54,11 +75,11 @@ On our pair, at `--context 1048576 --parallel 4` with the settings in `scripts/l
 
 | | |
 | --- | --- |
-| Decode, one stream (`kit_bench.py`, set a) | code 86.7, prose 56.9, structured 104.3 tok/s |
-| Prompt processing | ~2,050–2,150 tok/s from 8K to 160K tokens; a 1,040,000-token prompt in 653 s |
-| Exactness | 12 greedy replies byte-identical to the unpatched engine; resumed prompts equal fresh ones; tool calls 10/10 |
+| Decode, one stream (`kit_bench.py`, set a) | code 87.8, prose 57.6, structured 105.6 tok/s |
+| Prompt processing | ~2,050–2,150 tok/s from 8K to 160K tokens (`kit_bench.py`); a 1,040,000-token prompt in 653 s; `tests/prefill_speed.py` on a 50K-token prompt of source code: 2,031–2,047 tok/s with `TF_DS_ENGRAM_LEAD=1`, 1,961–1,995 without it (the same on the `45c25b1b` pin) |
+| Exactness | 12 greedy replies byte-identical to the unpatched engine; resumed prompts equal fresh ones; tool calls 10/10; `tests/quoted_prose_tail.py` 3/3 (0/3 before `0009`, `0010` and #35); `tests/think_quote.py` 2/2 (0/2 before `0011`-`0013`) |
 | Template | `/tokenize` ids identical for 1,500 random conversations; 5,000 identical renders in jinja2 |
-| Engine tests | `zig build test`: 222/222 |
+| Engine tests | `zig build test`: 232/232; the server's (`zig/tests/server/zig_test.sh`): 88 + 34, and `tool_parse_test.zig` 18 |
 
 The checkpoint's quality is measured in its [model card](https://huggingface.co/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw):
 against DeepSeek's FP8 release on the same 100 × 2,048 tokens, KL 0.0864 and top-1 agreement 90.8%.
@@ -139,6 +160,7 @@ Each step skips work already done, so it is safe to re-run.
 | `TF_MEMORY_RESERVE_GIB` | 4 | rank 0's CUDA reserve; the default (a tenth of the memory, ~12.2 GiB) leaves the weights no room with our kernel settings |
 | `SERVE_EXTRA` | `--prompt-cache-gib 0.5` | the kept prompt states' budget |
 | `INPUTS_CONTEXT`, `INPUTS_PARALLEL` | 65536, 1 | the window of step 5's one Python start (less memory; the rank caches are the same) |
+| `ENGINE_ENV` | `-e TF_DS_ENGRAM_LEAD=1` | extra `-e NAME=value` options for both ranks' containers (the engine's opt-in settings, such as `TF_DS_ENGRAM_LEAD=1`) |
 
 On the Sparks themselves: [`ops/memory_watchdog.sh`](ops/memory_watchdog.sh) stops the engine's container before a
 GB10 runs out of memory and stalls, and [`ops/memlog.sh`](ops/memlog.sh) logs where the memory goes every 30 s.
@@ -159,6 +181,8 @@ This builds on other people's work.
   [the TP2 recipe](https://github.com/bertholomus/deepseek-v4.1-tensorfold-tp2-2xgb10) (Apache-2.0).
 - **[ashhart](https://github.com/ashhart) and the TensorFold contributors:** [TensorFold](https://github.com/ashhart/TensorFold)
   (Apache-2.0), including the template and JSON fixes by Nathan McBride and Jay Leaton that #24 brought over.
+- **[Coinupbtc](https://github.com/Coinupbtc)** and **[Blackwellboy](https://github.com/Blackwellboy)**:
+  `0009` and `0010`; **[ashhart](https://github.com/ashhart)**: `0011`-`0012`. Each patch carries its author.
 - **[Mia's AI Lab](https://github.com/MiaAI-Lab):** the 2.9 bpw layout the checkpoint follows and the chat template it
   carries, which `model/chat_template.jinja` changes; the layout of these scripts comes from their GLM-5.3-Flash recipe.
 - **[turboderp](https://github.com/turboderp-org):** [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and the
@@ -166,8 +190,8 @@ This builds on other people's work.
 - **NVIDIA:** the DGX Spark and the [PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
   the image is built on.
 
-The changes in this repository (the engine patches, the template change, the recipe changes, `ops/` and `tests/`) are
-by [hashd1ve](https://github.com/hashd1ve). Not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors,
+The changes in this repository (the engine patches but `0009`-`0012`, the template change, the recipe changes, `ops/`
+and `tests/`) are by [hashd1ve](https://github.com/hashd1ve). Not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors,
 Bertholomus AI, easthambuilds or Mia's AI Lab.
 
 ## License

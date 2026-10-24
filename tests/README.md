@@ -16,6 +16,8 @@ All of them send greedy requests with thinking off, except `stream_tool_call.py`
 | `prefill_speed.py DOC REPS` | prompt tokens a second for a new prompt | ~2,100 tok/s alone |
 | `screenshot_turns.py TURNS` | each turn sends one new screenshot and every earlier one again, as OpenCode does; a turn costs about its new image | 8 turns: rank 0 +63 MiB at the peak (+483 MiB before `0006`-`0008`), turns 6-8 in 2.0-3.3 s (3.2-4.6) |
 | `python3 agent_session.py 218 30 8` (on the head) | an agent session of ~195K tokens with 30 screenshots, then 8 turns: each one's tokens resumed, seconds and rank 0's and the host's memory | +43 MiB a turn and at least 4.4 GiB free (+1.3 GiB and 2.6 GiB before), 3.0-8.0 s a turn (13.4-19.4) |
+| `quoted_prose_tail.py [quoted\|prose\|tail]` | a quoted control token stays text; the text before a tool call comes back as the content, streamed and not; a prompt ending <128 tokens past a kept state resumes an earlier one | 3/3 (0/3 on the `45c25b1b` pin) |
+| `think_quote.py` | a reply that writes `</think>` as text while it reasons keeps it in `reasoning_content`, and its answer is the content, whole and streamed | 2/2 (0/2 before `0011`-`0013`) |
 | `stream_tool_call.py` | a long tool call's arguments arrive in many deltas while they are written, and join to the same call as the unstreamed reply | 159 and 163 deltas over 7 and 12 s, the same call |
 
 `DOC` is any text file of a few thousand tokens (we used engine source files). `conversations.py` generates the

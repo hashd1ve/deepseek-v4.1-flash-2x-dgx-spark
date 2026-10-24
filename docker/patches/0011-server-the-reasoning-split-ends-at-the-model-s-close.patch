@@ -1,0 +1,452 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: ashhart <71890694+ashhart@users.noreply.github.com>
+Date: Thu, 22 Oct 2026 11:03:19 +0100
+Subject: [PATCH] server: the reasoning split ends at the model's close token
+
+The reply's reasoning was split at the first spelling of the close marker in the decoded
+text, so a reply that quotes </think> while reasoning ended its reasoning at the quote and
+the real answer after the model's own close token landed in the content. The server already
+split at the close token's id for logprobs' answerStart and reasoning_tokens' count, and
+those two agreed with each other and not with the text split.
+
+The close marker is now found in the reply's tokens when it is one token, and the split
+happens where that token's bytes begin. The stream and the whole reply both use it, and
+every family with a reasoning split is covered, because the token id comes from the model
+in use. The text split is kept for a tokenizer that has no token for the marker, and the
+split falls back to "all reasoning" when the bytes at the offset are not the marker.
+
+zig/src/server/think_split_test.zig is a server test over the real chat route: the reply
+quotes the tag in three pieces, so the decoded text spells it exactly as the old split
+looked for it, and the close token comes later. The reasoning keeps the quoted tag and the
+answer follows the close token, whole and streamed.
+
+(cherry picked from commit 23b943cb59a0f2129923dfd65768ad9803bdbbe4)
+---
+ zig/src/server/chat.zig             |   5 +-
+ zig/src/server/reply_text.zig       |  82 ++++++++--
+ zig/src/server/root.zig             |   1 +
+ zig/src/server/server.zig           |   2 +
+ zig/src/server/think_split_test.zig | 234 ++++++++++++++++++++++++++++
+ 5 files changed, 312 insertions(+), 12 deletions(-)
+ create mode 100644 zig/src/server/think_split_test.zig
+
+diff --git a/zig/src/server/chat.zig b/zig/src/server/chat.zig
+index 493b02c3..a78d48b0 100644
+--- a/zig/src/server/chat.zig
++++ b/zig/src/server/chat.zig
+@@ -383,7 +383,8 @@ const Generation = struct {
+         if (g.visible.pending()) return; // a character still split across tokens
+         var answer = text;
+         if (g.thinking) {
+-            const split = try reply_text.splitThinking(g.a, text, false, g.srv.markers);
++            const close = try g.visible.closeOf(g.a, decodeText, g.srv.text, g.srv.close_id);
++            const split = try reply_text.splitThinkingAt(g.a, text, false, g.srv.markers, close);
+             const piece = g.streamed_reasoning.after(split.reasoning, true);
+             if (piece.len > 0) {
+                 try g.streamed_reasoning.set(g.a, split.reasoning, piece);
+@@ -484,7 +485,7 @@ const Generation = struct {
+         var content: []const u8 = text;
+         var reasoning: ?[]const u8 = null;
+         if (g.thinking) {
+-            const split = try reply_text.splitThinking(a, text, true, g.srv.markers);
++            const split = try reply_text.splitThinkingTokens(a, decodeText, g.srv.text, text, true, g.srv.markers, content_tokens, g.srv.close_id);
+             const r = reply_text.pyStrip(split.reasoning);
+             reasoning = if (r.len > 0) r else null;
+             content = split.answer;
+diff --git a/zig/src/server/reply_text.zig b/zig/src/server/reply_text.zig
+index 4e2cca76..54dc90f6 100644
+--- a/zig/src/server/reply_text.zig
++++ b/zig/src/server/reply_text.zig
+@@ -55,14 +55,49 @@ fn trimNewlines(s: []const u8) []const u8 {
+ 
+ pub const Split = struct { reasoning: []const u8, answer: []const u8 };
+ 
++/// Where a reply's reasoning ends: the model's own close token, or the text's first spelling of the marker.
++pub const Close = union(enum) {
++    /// The close marker is not one token in this tokenizer: the first spelling of it in the text ends the reasoning.
++    spelled,
++    /// The close token's bytes begin here: the reasoning ends there, and a marker the reply quotes stays text.
++    token: usize,
++    /// The close marker is one token and the reply has not written it yet: all of the text so far is reasoning.
++    pending,
++};
++
++/// Where the reply's reasoning ends, from its tokens: the close token's bytes, the text's spelling, or all of it.
++pub fn closeWhere(a: Allocator, decode: anytype, ctx: anytype, tokens: []const u32, close_id: ?u32) !Close {
++    const id = close_id orelse return .spelled;
++    const at = std.mem.indexOfScalar(u32, tokens, id) orelse return .pending;
++    if (at == 0) return .{ .token = 0 };
++    return .{ .token = (try decode(ctx, a, tokens[0..at])).len };
++}
++
+ /// (reasoning, answer) of a thinking reply; while it streams, a tail that could begin a marker is held back.
+ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers) Allocator.Error!Split {
++    return splitThinkingAt(a, full, finished, m, .spelled);
++}
++
++/// As `splitThinkingAt`, but the close is found in the reply's tokens: the close token's own bytes end the reasoning.
++pub fn splitThinkingTokens(a: Allocator, decode: anytype, ctx: anytype, full: []const u8, finished: bool, m: Markers, tokens: []const u32, close_id: ?u32) !Split {
++    return splitThinkingAt(a, full, finished, m, try closeWhere(a, decode, ctx, tokens, close_id));
++}
++
++/// As `splitThinking`, but the close marker is the model's own close token: the reasoning ends at that token's bytes.
++pub fn splitThinkingAt(a: Allocator, full: []const u8, finished: bool, m: Markers, close: Close) Allocator.Error!Split {
+     var text = full;
++    var at: ?usize = switch (close) {
++        .spelled, .pending => null,
++        .token => |v| v,
++    };
+     if (m.open.len > 0 and !std.mem.startsWith(u8, text, m.open)) {
+         if (find(text, m.open)) |start| if (start > 0) {
+             var prefix = text[0..start];
+             prefix = prefix[0 .. prefix.len - partialTag(prefix, m.open)]; // a stray partial opener
+-            const inner = try splitThinking(a, text[start..], finished, m);
++            const inner = try splitThinkingAt(a, text[start..], finished, m, switch (close) {
++                .spelled, .pending => close,
++                .token => |v| .{ .token = if (v >= start) v - start else 0 },
++            });
+             return .{ .reasoning = inner.reasoning, .answer = try std.mem.concat(a, u8, &.{ prefix, inner.answer }) };
+         };
+         if (!finished) {
+@@ -72,23 +107,41 @@ pub fn splitThinking(a: Allocator, full: []const u8, finished: bool, m: Markers)
+         }
+         return .{ .reasoning = "", .answer = text };
+     }
++    var shift: usize = 0;
+     if (m.open.len > 0) {
+-        text = trimNewlines(text[m.open.len..]);
++        const rest = text[m.open.len..];
++        const trimmed = trimNewlines(rest);
++        shift = m.open.len + (rest.len - trimmed.len);
++        text = trimmed;
+     } else if (std.mem.startsWith(u8, text, think_open)) {
+-        text = trimNewlines(text[think_open.len..]);
++        const rest = text[think_open.len..];
++        const trimmed = trimNewlines(rest);
++        shift = think_open.len + (rest.len - trimmed.len);
++        text = trimmed;
+     } else if (!finished and std.mem.startsWith(u8, think_open, text)) {
+         return .{ .reasoning = "", .answer = "" }; // held while the reply may still be writing that opener
+     }
+-    if (find(text, m.close)) |end| return .{ .reasoning = text[0..end], .answer = trimNewlines(text[end + m.close.len ..]) };
++    if (at) |v| at = if (v >= shift) v - shift else null;
++    const end: ?usize = switch (close) {
++        .spelled => find(text, m.close),
++        .pending => null,
++        .token => at,
++    };
++    if (end) |at_end| {
++        if (at_end + m.close.len <= text.len and std.mem.startsWith(u8, text[at_end..], m.close)) {
++            return .{ .reasoning = text[0..at_end], .answer = trimNewlines(text[at_end + m.close.len ..]) };
++        }
++        // the close token's bytes are not where the text says: the whole text is reasoning
++    }
+     var call: ?usize = null;
+-    for (calls) |c| if (find(text, c[0])) |at| {
+-        if (call == null or at < call.?) call = at;
++    for (calls) |c| if (find(text, c[0])) |at_call| {
++        if (call == null or at_call < call.?) call = at_call;
+     };
+-    if (call) |at| {
++    if (call) |at_call| {
+         // a call written before the block closes: held while the block may still close, the answer if the reply ends
+-        if (!finished) return .{ .reasoning = text[0..at], .answer = "" };
+-        for (calls) |c| if (std.mem.startsWith(u8, text[at..], c[0]) and find(text[at..], c[1]) != null)
+-            return .{ .reasoning = text[0..at], .answer = text[at..] };
++        if (!finished) return .{ .reasoning = text[0..at_call], .answer = "" };
++        for (calls) |c| if (std.mem.startsWith(u8, text[at_call..], c[0]) and find(text[at_call..], c[1]) != null)
++            return .{ .reasoning = text[0..at_call], .answer = text[at_call..] };
+         return .{ .reasoning = text, .answer = "" };
+     }
+     var held: usize = 0;
+@@ -293,6 +346,15 @@ pub const Incremental = struct {
+     text: std.ArrayList(u8) = .empty,
+     prefix: usize = 0,
+     read: usize = 0,
++    close: ?Close = null, // where the reasoning ends, once the close token has arrived
++
++    /// Where the reply's reasoning ends: the close token's bytes once it has arrived, or the text's spelling of it.
++    pub fn closeOf(inc: *Incremental, a: Allocator, decode: anytype, ctx: anytype, close_id: ?u32) !Close {
++        if (inc.close) |c| return c;
++        const c = try closeWhere(a, decode, ctx, inc.tokens.items, close_id);
++        if (c != .pending) inc.close = c; // a pending close is not kept: the token may still arrive
++        return c;
++    }
+ 
+     pub fn extend(inc: *Incremental, a: Allocator, ctx: anytype, decode: anytype, more: []const u32) ![]const u8 {
+         try inc.tokens.appendSlice(a, more);
+diff --git a/zig/src/server/root.zig b/zig/src/server/root.zig
+index be79d1cb..95efe289 100644
+--- a/zig/src/server/root.zig
++++ b/zig/src/server/root.zig
+@@ -37,6 +37,7 @@ test {
+     _ = @import("messages.zig");
+     _ = @import("stream_preflight_test.zig");
+     _ = @import("literal_tokens_test.zig");
++    _ = @import("think_split_test.zig");
+     _ = @import("late_system_test.zig");
+     _ = @import("prompt_memory_test.zig");
+     _ = @import("effort_values_test.zig");
+diff --git a/zig/src/server/server.zig b/zig/src/server/server.zig
+index 29a53829..aa348ec6 100644
+--- a/zig/src/server/server.zig
++++ b/zig/src/server/server.zig
+@@ -63,6 +63,7 @@ pub const Server = struct {
+     late_system: []const u8 = "system",
+     needs_user_after_tool: bool = false,
+     markers: reply_text.Markers = reply_text.think_markers,
++    close_id: ?u32 = null, // the close marker's own token, when the marker is one token
+     chunks: chunk_plan.Plan = .{},
+     effort_levels: []const []const u8 = &.{},
+     /// The engine's numbers for its efforts (Info.efforts); empty: the template hears the names.
+@@ -93,6 +94,7 @@ pub const Server = struct {
+         const a = srv.arena.allocator();
+         srv.eos = try a.dupe(u32, text.eosIds());
+         if (text.tokenId(reply_text.channel_markers.close) != null) srv.markers = reply_text.channel_markers;
++        srv.close_id = text.tokenId(srv.markers.close);
+         if (srv.info.efforts.len > 0) {
+             // a family whose template takes numbers: every name it gives one passes as asked, rendered as that number
+             const names = try a.alloc([]const u8, srv.info.efforts.len);
+diff --git a/zig/src/server/think_split_test.zig b/zig/src/server/think_split_test.zig
+new file mode 100644
+index 00000000..ba6089ce
+--- /dev/null
++++ b/zig/src/server/think_split_test.zig
+@@ -0,0 +1,234 @@
++//! The reasoning split ends at the model's own close token: a `</think>` the reply quotes in pieces stays reasoning.
++const std = @import("std");
++const api = @import("engine_api");
++const server = @import("root.zig");
++const json = server.json;
++const model_text = @import("model_text.zig");
++const openai = @import("openai.zig");
++const Conn = @import("http_conn.zig").Conn;
++
++const think_end: u32 = 300; // the close marker as one token
++const eos: u32 = 301;
++const quote_open: u32 = 302; // the quoted tag, in the three pieces a reply writes it
++const quote_mid: u32 = 303;
++const quote_close: u32 = 304;
++const all_bytes = blk: {
++    var all: [256]u8 = undefined;
++    for (&all, 0..) |*b, i| b.* = i;
++    break :blk all;
++};
++
++/// Bytes as tokens, `</think>` as token 300 and an end token 301; every prompt renders as "prompt".
++const Text = struct {
++    close_token: bool = true, // false: the close marker is not a token, so the text's spelling is what closes
++
++    fn text(t: *@This()) model_text.Text {
++        return .{ .ctx = t, .vtable = &.{ .encode = encode, .decode = decode, .token_id = tokenId, .token_string = tokenString, .vocab_size = vocabSize, .eos_ids = eosIds, .render = render, .template_source = templateSource, .token_bytes = tokenBytes } };
++    }
++
++    /// The close marker is one token; the quoted tag is three, so the text spells the same and the tokens differ.
++    fn piece(id: u32) []const u8 {
++        if (id == think_end) return "</think>";
++        if (id == eos) return "";
++        if (id == quote_open) return "</";
++        if (id == quote_mid) return "think";
++        if (id == quote_close) return ">";
++        return all_bytes[id..][0..1];
++    }
++
++    fn encode(_: *anyopaque, a: std.mem.Allocator, input: []const u8, _: bool) model_text.Error![]u32 {
++        const ids = try a.alloc(u32, input.len);
++        for (input, ids) |byte, *id| id.* = byte;
++        return ids;
++    }
++
++    fn decode(_: *anyopaque, a: std.mem.Allocator, ids: []const u32) std.mem.Allocator.Error![]u8 {
++        var out: std.ArrayList(u8) = .empty;
++        for (ids) |id| try out.appendSlice(a, piece(id));
++        return out.items;
++    }
++
++    fn tokenBytes(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error!?[]u8 {
++        return try a.dupe(u8, piece(id));
++    }
++
++    fn tokenId(ctx: *anyopaque, p: []const u8) ?u32 {
++        const t: *Text = @ptrCast(@alignCast(ctx));
++        if (!t.close_token) return null;
++        return if (std.mem.eql(u8, p, "</think>")) think_end else null;
++    }
++
++    fn tokenString(_: *anyopaque, a: std.mem.Allocator, id: u32) std.mem.Allocator.Error![]u8 {
++        return a.dupe(u8, piece(id));
++    }
++
++    fn vocabSize(_: *anyopaque) u32 {
++        return 305;
++    }
++
++    fn eosIds(_: *anyopaque) []const u32 {
++        return &.{eos};
++    }
++
++    fn render(_: *anyopaque, a: std.mem.Allocator, _: json.Value, _: model_text.RenderOptions, _: *[]const u8) model_text.Error!model_text.Rendered {
++        return .{ .text = try (a.dupe(u8, "prompt")) };
++    }
++
++    fn templateSource(_: *anyopaque) []const u8 {
++        return "";
++    }
++};
++
++/// Answers `reply` in two rounds, the first half then the rest.
++const Script = struct {
++    reply: []const u32,
++
++    fn engine(e: *@This()) api.Engine {
++        return .{ .ctx = e, .vtable = &.{ .info = info, .submit = submit, .cancel = cancel, .status = status, .memory = memory } };
++    }
++
++    fn info(_: *anyopaque) api.Info {
++        return .{ .context_window = 64 };
++    }
++
++    fn submit(ctx: *anyopaque, id: api.Id, _: *const api.Request, sink: api.Sink) api.SubmitError!void {
++        const e: *Script = @ptrCast(@alignCast(ctx));
++        sink.event(sink.ctx, id, &.{ .prefilled = 0 });
++        const half = e.reply.len / 2;
++        for ([_][2]usize{ .{ 0, half }, .{ half, e.reply.len } }) |part| {
++            sink.event(sink.ctx, id, &.{ .tokens = e.reply[part[0]..part[1]] });
++        }
++        const ended = e.reply.len > 0 and e.reply[e.reply.len - 1] == eos;
++        sink.event(sink.ctx, id, &.{ .finished = .{ .reason = if (ended) .stop else .length } });
++    }
++
++    fn cancel(_: *anyopaque, _: api.Id) void {}
++
++    fn status(_: *anyopaque, out: *api.Status, _: []u32) void {
++        out.* = .{};
++    }
++
++    fn memory(_: *anyopaque, _: bool) ?api.Memory {
++        return null;
++    }
++};
++
++/// The reply the route wrote: its status and body, or a stream's events, as JSON text (testing-allocator owned).
++const Got = struct {
++    status: u16 = 0,
++    body: []u8 = &.{},
++    events: std.ArrayList([]u8) = .empty,
++
++    fn out(g: *Got) openai.Out {
++        return .{ .ctx = g, .vt = &.{ .open = open, .event = event, .reply = reply } };
++    }
++
++    fn deinit(g: *Got) void {
++        std.testing.allocator.free(g.body);
++        for (g.events.items) |e| std.testing.allocator.free(e);
++        g.events.deinit(std.testing.allocator);
++    }
++
++    fn open(_: *anyopaque, _: usize) error{Closed}!void {}
++
++    fn event(ctx: *anyopaque, payload: ?json.Value) error{Closed}!void {
++        const g: *Got = @ptrCast(@alignCast(ctx));
++        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++        defer arena.deinit();
++        const text = json.stringify(arena.allocator(), payload orelse return, .{ .ascii = false }) catch return error.Closed;
++        g.events.append(std.testing.allocator, std.testing.allocator.dupe(u8, text) catch return error.Closed) catch return error.Closed;
++    }
++
++    fn reply(ctx: *anyopaque, status: u16, payload: json.Value) void {
++        const g: *Got = @ptrCast(@alignCast(ctx));
++        g.status = status;
++        var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++        defer arena.deinit();
++        const text = json.stringify(arena.allocator(), payload, .{ .ascii = false }) catch return;
++        g.body = std.testing.allocator.dupe(u8, text) catch return;
++    }
++};
++
++fn send(reply: []const u32, thinking: bool, body: []const u8) !Got {
++    return sendWith(reply, thinking, body, true);
++}
++
++fn sendWith(reply: []const u32, thinking: bool, body: []const u8, close_token: bool) !Got {
++    var text: Text = .{ .close_token = close_token };
++    var backend: Script = .{ .reply = reply };
++    var srv = try server.Server.init(std.testing.allocator, std.testing.io, backend.engine(), text.text(), .{
++        .served_name = "test-model",
++        .model_ids = &.{"test-model"},
++        .enable_thinking = thinking,
++        .use_drafts = false,
++    }, null);
++    defer srv.deinit();
++    var arena = std.heap.ArenaAllocator.init(std.testing.allocator);
++    defer arena.deinit();
++    const a = arena.allocator();
++    const raw = (try json.parse(a, body)).ok;
++    var conn: Conn = .{ .fd = -1, .peer = "", .buf = &.{}, .gpa = a };
++    var got: Got = .{};
++    openai.run(srv, a, got.out(), .{ .conn = &conn }, true, raw);
++    return got;
++}
++
++fn tokensOf(comptime s: []const u8) [s.len]u32 {
++    var out: [s.len]u32 = undefined;
++    for (s, &out) |c, *o| o.* = c;
++    return out;
++}
++
++/// The reply's message: its content and its reasoning.
++fn message(got: *Got) !std.json.Parsed(std.json.Value) {
++    try std.testing.expectEqual(@as(u16, 200), got.status);
++    return std.json.parseFromSlice(std.json.Value, std.testing.allocator, got.body, .{});
++}
++
++const ask = "{\"model\":\"test-model\",\"messages\":[{\"role\":\"user\",\"content\":\"x\"}],\"max_tokens\":32";
++
++/// The reasoning quotes the tag in three pieces, then the model closes with its own close token.
++const quoted = tokensOf("I will ") ++ [_]u32{ quote_open, quote_mid, quote_close } ++ tokensOf(" say it") ++
++    [_]u32{think_end} ++ tokensOf(" done") ++ [_]u32{eos};
++
++test "the reasoning ends at the close token, so a quoted tag stays reasoning" {
++    var got = try send(&quoted, true, ask ++ "}");
++    defer got.deinit();
++    const parsed = try message(&got);
++    defer parsed.deinit();
++    const m = parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object;
++    try std.testing.expectEqualStrings("I will </think> say it", m.get("reasoning_content").?.string);
++    try std.testing.expectEqualStrings(" done", m.get("content").?.string);
++}
++
++test "a tokenizer without a close token keeps the text split" {
++    // the close marker is not one token here, so the text's first spelling of it ends the reasoning
++    const spelled = tokensOf("I will </think> say it done") ++ [_]u32{eos};
++    var got = try sendWith(&spelled, true, ask ++ "}", false);
++    defer got.deinit();
++    const parsed = try message(&got);
++    defer parsed.deinit();
++    const m = parsed.value.object.get("choices").?.array.items[0].object.get("message").?.object;
++    try std.testing.expectEqualStrings("I will", m.get("reasoning_content").?.string);
++    try std.testing.expectEqualStrings(" say it done", m.get("content").?.string);
++}
++
++test "the stream's reasoning and content end at the close token too" {
++    var got = try send(&quoted, true, ask ++ ",\"stream\":true}");
++    defer got.deinit();
++    var reasoning: std.ArrayList(u8) = .empty;
++    defer reasoning.deinit(std.testing.allocator);
++    var content: std.ArrayList(u8) = .empty;
++    defer content.deinit(std.testing.allocator);
++    for (got.events.items) |e| {
++        const chunk = try std.json.parseFromSlice(std.json.Value, std.testing.allocator, e, .{});
++        defer chunk.deinit();
++        const choices = chunk.value.object.get("choices") orelse continue;
++        if (choices.array.items.len == 0) continue;
++        const delta = choices.array.items[0].object.get("delta").?.object;
++        if (delta.get("reasoning_content")) |r| try reasoning.appendSlice(std.testing.allocator, r.string);
++        if (delta.get("content")) |c| try content.appendSlice(std.testing.allocator, c.string);
++    }
++    try std.testing.expectEqualStrings("I will </think> say it", reasoning.items);
++    try std.testing.expectEqualStrings(" done", content.items);
++}
+-- 
+2.54.0 (Apple Git-157)
+

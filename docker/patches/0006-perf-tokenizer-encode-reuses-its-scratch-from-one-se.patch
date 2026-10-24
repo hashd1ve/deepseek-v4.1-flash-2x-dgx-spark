@@ -1,8 +1,8 @@
-From d49f66f408ef1c2d52042b2e1eb21f82e1128e37 Mon Sep 17 00:00:00 2001
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
 From: Manrique <125496885+hashd1ve@users.noreply.github.com>
 Date: Mon, 19 Oct 2026 22:37:58 +0100
-Subject: [PATCH 6/8] perf(tokenizer): encode reuses its scratch from one
- segment and one word to the next
+Subject: [PATCH] perf(tokenizer): encode reuses its scratch from one segment
+ and one word to the next
 
 encode ran every pre-tokenizer step and every word's BPE in one arena over the caller's allocator, so a prompt kept ~800 bytes a token until the call returned, and for good when the caller's allocator is a request's arena: 229 MiB for a 296K-token prompt, held while the reply ran. The added-token segments and the words now each reset their own arena, and the ids are appended to the caller's list: 5.6 MiB for the same prompt, the same ids (24.5M tokens of random and real text against the previous encode), a little faster.
 ---
@@ -10,7 +10,7 @@ encode ran every pre-tokenizer step and every word's BPE in one arena over the c
  1 file changed, 48 insertions(+), 8 deletions(-)
 
 diff --git a/zig/src/core/tokenizer/tokenizer.zig b/zig/src/core/tokenizer/tokenizer.zig
-index 176d9958..2a90a688 100644
+index 176d995..2a90a68 100644
 --- a/zig/src/core/tokenizer/tokenizer.zig
 +++ b/zig/src/core/tokenizer/tokenizer.zig
 @@ -113,6 +113,8 @@ pub const Tokenizer = struct {
@@ -100,5 +100,5 @@ index 176d9958..2a90a688 100644
 +    try std.testing.expect(arena.queryCapacity() < 32 * ids.len);
 +}
 -- 
-2.51.1
+2.54.0 (Apple Git-157)
 

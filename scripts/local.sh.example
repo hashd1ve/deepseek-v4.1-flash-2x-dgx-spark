@@ -25,3 +25,6 @@ GID_INDEX=5                    # RoCE v2 GID index; check with show_gids
 TF_FILL_CHUNKS=1
 TF_FILL_ROUNDS=4
 TF_FILL_FIRST=4
+# Each Engram layer reads its prompt rows a chunk ahead on a reader of its own (TensorFold#41): ~3 % faster prompts on our
+# pair, the same replies. ENGINE_ENV is passed to both ranks' containers.
+ENGINE_ENV="-e TF_DS_ENGRAM_LEAD=1"
