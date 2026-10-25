@@ -123,6 +123,10 @@ curl -s http://127.0.0.1:18891/v1/chat/completions -H 'Content-Type: application
 nohup ops/keep_serving.sh > /dev/null 2>&1 &   # optional: start it again when a rank dies (see below)
 ```
 
+Optional [Keys abliteration overlay](docs/ablit.md): `./start.sh restart --abliterated` enables it for one launch;
+`./start.sh restart --stock` restores stock. Stock remains the default. The overlay changes only derived rank-cache
+fragments, keeps the base checkpoint and MTP untouched, and needs about 1.3 GiB extra per Spark.
+
 `ops/keep_serving.sh` starts the server again when a rank goes down without `./stop.sh` (a crash, or
 `ops/memory_watchdog.sh` stopping it), at most 3 times in 2 hours; its log is `DATA_DIR/keep_serving.log`. With it
 running, stop the server with `./stop.sh`, never with `docker stop`.
