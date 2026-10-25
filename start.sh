@@ -2,8 +2,19 @@
 # start.sh [restart] [tensorfold-native serve arguments...]: set up both Sparks if needed, start rank 1 on the worker
 # and rank 0 (the API) here, wait until they load, and send one smoke-test request through both.
 . "$(dirname "$0")/scripts/common.sh"
+. "$ROOT/scripts/ablit.sh"
 RESTART=0
-[ "${1:-}" = restart ] && { RESTART=1; shift; }
+while [ "$#" -gt 0 ]; do
+  case "$1" in
+    restart) RESTART=1; shift ;;
+    --abliterated) ABLIT=1; shift ;;
+    --stock) ABLIT=0; shift ;;
+    *) break ;;
+  esac
+done
+mkdir -p "$DATA_DIR"
+exec 9>"$DATA_DIR/.launch.lock"
+flock -n 9 || die "another start.sh is running"
 rm -f "$DATA_DIR/.stopped"  # (stop.sh's mark: ops/keep_serving.sh may start it again when it goes down)
 
 step "Setup"
@@ -13,6 +24,7 @@ else
   bash "$ROOT/scripts/prepare.sh"
 fi
 
+ablit_prepare
 step "Checks"
 if running_here "$CONTAINER" || running_there "$CONTAINER"; then
   [ $RESTART = 1 ] || die "already running: ./start.sh restart, or ./stop.sh"
@@ -21,6 +33,7 @@ if running_here "$CONTAINER" || running_there "$CONTAINER"; then
 else
   remove_both "$CONTAINER" >/dev/null   # a stopped container from an earlier run; its log is kept
 fi
+ablit_switch
 # GB10 shares memory between GPU and CPU and reclaims page cache too slowly for CUDA (tools/evict_page_cache.py)
 note "here: $(python3 "$ROOT/tools/evict_page_cache.py" "$DATA_DIR"/{model,engram,cache})"
 note "$WORKER: $(on_worker python3 - "$WORKER_DATA_DIR"/{model,engram,cache} < "$ROOT/tools/evict_page_cache.py")"
