@@ -1,0 +1,335 @@
+From a6f4b72f06193985645b543e831240d993859bbe Mon Sep 17 00:00:00 2001
+From: Blackwellboy <76774064+Blackwellboy@users.noreply.github.com>
+Date: Fri, 23 Oct 2026 06:46:03 +1100
+Subject: [PATCH 17/20] lanes: TF_FILL_CUT_IN=T lets a prompt of at most T
+ tokens run between another pass's pieces (off by default)
+
+A prompt pass ran whole, or in TF_FILL_CHUNKS pieces only while other streams decoded, and nothing was admitted
+until it ended: a short request sent behind a 64K-token prompt waited out the whole pass (28-36 s on two GB10s).
+
+With TF_FILL_CUT_IN set (and TF_FILL_CHUNKS), every pass runs in pieces, also with no stream decoding, and between
+two pieces the host admits the first queued request whose prompt is at most T tokens and has no images. Its pass
+runs whole there; the paused pass then resumes from its next chunk. The dsv41 backend keeps the paused pass and
+resumes it with a fill_resume frame, so both ranks' model views return to its slot and extent (its rows, rings and
+ids stay in its own slot meanwhile). Unset, nothing changes.
+
+(cherry picked from commit 16701b487a8e1c695a31fdd7cba2af72a3b9c6e2)
+---
+ zig/src/core/lane_host.zig       |  15 +++-
+ zig/src/core/lane_host_test.zig  | 113 +++++++++++++++++++++++++++++++
+ zig/src/core/lanes/engine.zig    |  18 ++++-
+ zig/src/families/dsv41/lanes.zig |  40 +++++++++--
+ zig/src/native/cuda.zig          |   2 +
+ 5 files changed, 179 insertions(+), 9 deletions(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 8baf2a36..7c1a1f32 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -293,13 +293,22 @@ pub const LaneHost = struct {
+         h.mutex.unlock(h.io);
+     }
+ 
+-    /// Prefills the next queued request into a free lane; false when none waits or no lane is free.
++    /// Prefills the next queued request (while a pass fills, the first that core.cutsIn); false if none or no lane.
+     fn admitOne(h: *LaneHost) bool {
+         h.lock();
+-        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes or h.filling != null) {
++        if (h.queued.items.len == 0 or h.admitted.items.len >= h.info_.lanes) {
+             h.unlock();
+             return false;
+         }
++        var at: usize = 0;
++        if (h.filling != null) {
++            at = for (h.queued.items, 0..) |j, i| {
++                if (h.core.cutsIn(j.request.prompt.len, j.request.images.len > 0)) break i;
++            } else {
++                h.unlock();
++                return false;
++            };
++        }
+         if (h.full_wait) |n| {
+             const active = h.core.activeCount();
+             if (active > 0 and active >= n and std.Io.Clock.awake.now(h.io).toNanoseconds() < h.full_retry) {
+@@ -315,7 +324,7 @@ pub const LaneHost = struct {
+             }
+             h.finish_until = null;
+         }
+-        const job = h.queued.orderedRemove(0);
++        const job = h.queued.orderedRemove(at);
+         h.admitted.append(h.gpa, job) catch {
+             h.unlock();
+             h.finish(job, .failed, "out of memory");
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 265ccb14..87134b04 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -384,3 +384,116 @@ test "a prompt within the first piece runs whole: the decoding stream waits for
+         try history.append(gpa, t);
+     }
+ }
++
++/// A long pass in pieces (cut_in set, nothing decoding), a request sent in its first chunk: chunk order, both replies.
++const CutIn = struct {
++    mutex: std.Io.Mutex = .init,
++    seen: std.ArrayList([2]usize) = .empty,
++    a: std.ArrayList(u32) = .empty,
++    b: std.ArrayList(u32) = .empty,
++    first: bool = false, // the long pass's first chunk is running
++    sent: bool = false, // the second request is queued
++    a_done: bool = false,
++    b_done: bool = false,
++
++    fn hook(ctx: *anyopaque, s: *lanes.stream.Stream, chunk: usize) void {
++        const w: *CutIn = @ptrCast(@alignCast(ctx));
++        w.mutex.lockUncancelable(std.testing.io);
++        w.seen.append(std.testing.allocator, .{ s.prompt_len, chunk }) catch {};
++        const wait = s.prompt_len == long.len and chunk == 0;
++        if (wait) w.first = true;
++        w.mutex.unlock(std.testing.io);
++        // the long pass's first chunk holds the engine until the second request is in the queue
++        if (wait) w.until(.sent) catch {};
++    }
++
++    fn event(ctx: *anyopaque, id: Id, e: *const Event) void {
++        const w: *CutIn = @ptrCast(@alignCast(ctx));
++        w.mutex.lockUncancelable(std.testing.io);
++        defer w.mutex.unlock(std.testing.io);
++        switch (e.*) {
++            .tokens => |t| (if (id == 1) &w.a else &w.b).appendSlice(std.testing.allocator, t) catch {},
++            .finished => if (id == 1) {
++                w.a_done = true;
++            } else {
++                w.b_done = true;
++            },
++            else => {},
++        }
++    }
++
++    fn until(w: *CutIn, comptime what: enum { first, sent, done }) !void {
++        for (0..20000) |_| {
++            w.mutex.lockUncancelable(std.testing.io);
++            const ok = switch (what) {
++                .first => w.first,
++                .sent => w.sent,
++                .done => w.a_done and w.b_done,
++            };
++            w.mutex.unlock(std.testing.io);
++            if (ok) return;
++            std.Io.sleep(std.testing.io, .fromMilliseconds(1), .awake) catch {};
++        }
++        return error.Timeout;
++    }
++
++    const long = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
++
++    /// The long request, then `second`, cut_in 4: the chunk order (caller frees), each reply checked as the fake's.
++    fn run(second: []const u32) ![][2]usize {
++        const gpa = std.testing.allocator;
++        var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
++        defer cfg.deinit(gpa);
++        var w: CutIn = .{};
++        defer w.a.deinit(gpa);
++        defer w.b.deinit(gpa);
++        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w };
++        defer target.deinit();
++        var clock: lanes.fake.FixedClock = .{};
++        var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
++        defer core.deinit();
++        core.fill_chunks = 1;
++        core.fill_rounds = 2;
++        core.cut_in = 4;
++        var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
++        try host.start();
++        defer host.stop();
++        const e = host.engine();
++        try e.submit(1, &.{ .prompt = &long, .max_tokens = 6 }, .{ .ctx = &w, .event = event });
++        try w.until(.first);
++        try e.submit(2, &.{ .prompt = second, .max_tokens = 6 }, .{ .ctx = &w, .event = event });
++        w.mutex.lockUncancelable(std.testing.io);
++        w.sent = true;
++        w.mutex.unlock(std.testing.io);
++        try w.until(.done);
++        for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
++            var history: std.ArrayList(u32) = .empty;
++            defer history.deinit(gpa);
++            try history.appendSlice(gpa, prompt);
++            try std.testing.expectEqual(@as(usize, 6), reply.len);
++            for (reply) |t| {
++                try std.testing.expectEqual(lanes.fake.next(history.items, null, history.items.len), t);
++                try history.append(gpa, t);
++            }
++        }
++        return w.seen.toOwnedSlice(gpa);
++    }
++};
++
++test "a short prompt cuts in: its whole pass runs between a long pass's pieces, and both replies are unchanged" {
++    const order = try CutIn.run(&.{ 3, 1, 4 });
++    defer std.testing.allocator.free(order);
++    try std.testing.expectEqual(@as(usize, 12), order.len);
++    // the long pass's first chunk, the short pass whole, then the long pass's other five chunks
++    try std.testing.expectEqual([2]usize{ CutIn.long.len, 0 }, order[0]);
++    for (order[1..7], 0..) |o, i| try std.testing.expectEqual([2]usize{ 3, i }, o);
++    for (order[7..12], 1..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
++}
++
++test "a prompt longer than cut_in waits for the pass in pieces, as before" {
++    const order = try CutIn.run(&.{ 3, 1, 4, 1, 5 });
++    defer std.testing.allocator.free(order);
++    try std.testing.expectEqual(@as(usize, 12), order.len);
++    for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
++    for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 5, i }, o);
++}
+diff --git a/zig/src/core/lanes/engine.zig b/zig/src/core/lanes/engine.zig
+index b439d222..9a8f84cb 100644
+--- a/zig/src/core/lanes/engine.zig
++++ b/zig/src/core/lanes/engine.zig
+@@ -42,6 +42,7 @@ pub const Engine = struct {
+     fill_chunks: u32 = 0, // a piece's chunks (backend prefill_part; 0: a prompt pass runs whole inside addStream)
+     fill_rounds: u32 = 4, // the live streams' rounds between two pieces
+     fill_first: u32 = 0, // the first piece's chunks (0: fill_chunks): a short prompt then runs whole
++    cut_in: u32 = 0, // prompts of at most this many tokens cut in between pieces; set, every pass runs in pieces
+     rounds_since: u32 = 0,
+ 
+     pub fn init(gpa: Allocator, cfg: *const Config, backend: be.Backend, clock: be.Clock) Engine {
+@@ -86,8 +87,15 @@ pub const Engine = struct {
+     pub fn addStream(e: *Engine, s: *Stream) !void {
+         _ = e.arena.reset(.retain_capacity);
+         try trail.event(e, &.{ f("ev", str("add")), f("stream", str(s.id)) });
+-        if (e.filling != null) return error.FillBusy;
+-        if (e.fill_chunks > 0 and e.backend.vtable.prefill_part != null and e.activeCount() > 0) {
++        if (e.filling != null) {
++            if (!e.cutsIn(s.prompt_len, s.images.len > 0)) return error.FillBusy;
++            e.backend.prefill(s) catch |err| {
++                if (err == error.Cancelled) e.backend.release(s);
++                return err;
++            };
++            return e.started(s);
++        }
++        if (e.fill_chunks > 0 and e.backend.vtable.prefill_part != null and (e.activeCount() > 0 or e.cut_in > 0)) {
+             if (!try e.piece(s, if (e.fill_first > 0) e.fill_first else e.fill_chunks)) {
+                 e.filling = s;
+                 e.rounds_since = 0;
+@@ -100,6 +108,12 @@ pub const Engine = struct {
+         try e.started(s);
+     }
+ 
++    /// Whether a prompt of `len` tokens runs whole between the filling stream's pieces (no images: one at a time).
++    pub fn cutsIn(e: *const Engine, len: usize, images: bool) bool {
++        const filling = e.filling orelse return false;
++        return e.cut_in > 0 and len <= e.cut_in and !images and filling.images.len == 0;
++    }
++
+     fn piece(e: *Engine, s: *Stream, chunks: u32) !bool {
+         return e.backend.vtable.prefill_part.?(e.backend.ptr, s, chunks) catch |err| {
+             if (err == error.Cancelled) e.backend.release(s);
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index d3d3090b..ceaba6a1 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -37,7 +37,7 @@ pub const image_piece = 32 << 10;
+ pub var logits_sha = false;
+ 
+ /// The primitives rank 0 sends rank 1 (each frame: kind u8, step u64, its fields little-endian).
+-pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9 };
++pub const Kind = enum(u8) { fill_begin = 1, fill_chunk = 2, verify = 3, pass = 4, snap_save = 5, snap_restore = 6, snap_drop = 7, fill_images = 8, done = 9, fill_resume = 10 };
+ 
+ /// A frame being written.
+ pub const Wire = struct {
+@@ -327,6 +327,7 @@ pub const Lanes = struct {
+     snaps: std.ArrayList(*Snap) = .empty, // kept prompt states, oldest first
+     next_snap: u64 = 1,
+     fill: ?Fill = null, // the prompt pass that runs in pieces between rounds, from its next chunk
++    paused: ?Fill = null, // the pass a short prompt cut into (lanes' cut_in), resumed by its next piece
+ 
+     pub fn init(gpa: std.mem.Allocator, m: *Model) Lanes {
+         var ln: Lanes = .{ .gpa = gpa, .m = m, .peer = if (m.world > 1) m.peer() else null };
+@@ -444,9 +445,15 @@ pub const Lanes = struct {
+         defer if (self.prof) |*p| {
+             p.prefill += m.now() - t0;
+         };
+-        if (self.fill) |f| {
+-            if (f.s != s) return error.FillBusy;
+-        } else try self.fillOpen(s);
++        if (self.fill) |f| if (f.s != s) {
++            // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
++            if (self.paused != null or f.s.images.len > 0) return error.FillBusy;
++            self.paused = f;
++            self.fill = null;
++        };
++        if (self.fill == null) {
++            if (self.paused != null and self.paused.?.s == s) try self.fillResume() else try self.fillOpen(s);
++        }
+         errdefer self.fill = null;
+         const f = &self.fill.?;
+         const seq = self.seqs[f.slot].items;
+@@ -488,6 +495,20 @@ pub const Lanes = struct {
+         return true;
+     }
+ 
++    /// A paused pass resumes: both ranks' model views back on its slot and extent, whose rows, rings and ids it kept.
++    fn fillResume(self: *Lanes) !void {
++        const f = self.paused.?;
++        const l = self.streams.get(f.s) orelse return error.UnknownStream;
++        if (try self.begin(.fill_resume)) {
++            try self.wire.int(self.gpa, u32, @intCast(f.slot));
++            try self.wire.int(self.gpa, u64, l.base);
++            try self.flush();
++        }
++        try self.m.fillBegin(f.slot, l.base);
++        self.fill = f;
++        self.paused = null;
++    }
++
+     /// A prompt pass's start: its slot and extent, its images, rank 1's fill and the kept state it resumes from.
+     fn fillOpen(self: *Lanes, s: *lanes.Stream) !void {
+         const m = self.m;
+@@ -911,6 +932,9 @@ pub const Lanes = struct {
+             self.m.fill_seq = &.{};
+             self.fill = null;
+         };
++        if (self.paused) |f| if (f.s == s) {
++            self.paused = null;
++        };
+         const kv = self.streams.fetchRemove(s) orelse return;
+         self.used[kv.value.slot] = false;
+     }
+@@ -968,6 +992,7 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+             7 => .snap_drop,
+             8 => .fill_images,
+             9 => .done,
++            10 => .fill_resume,
+             else => return error.BadFrame,
+         };
+         if (try r.int(u64) != step) return error.OutOfStep;
+@@ -987,6 +1012,13 @@ pub fn follow(gpa: std.mem.Allocator, m: *Model) !void {
+                 m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
+                 m.fill_seq = seqs[slot].items;
+             },
++            .fill_resume => {
++                slot = try r.int(u32);
++                const base = try r.int(u64);
++                if (slot >= max_streams) return error.BadSlot;
++                m.fillBegin(slot, @intCast(base)) catch |err| refused(err);
++                m.fill_seq = seqs[slot].items;
++            },
+             .fill_chunk => {
+                 const start: usize = @intCast(try r.int(u64));
+                 const n: usize = try r.int(u32);
+diff --git a/zig/src/native/cuda.zig b/zig/src/native/cuda.zig
+index ad6f2f22..7849ec54 100644
+--- a/zig/src/native/cuda.zig
++++ b/zig/src/native/cuda.zig
+@@ -201,6 +201,8 @@ const Host = struct {
+         h.core.fill_chunks = envInt("TF_FILL_CHUNKS") orelse 0;
+         h.core.fill_rounds = envInt("TF_FILL_ROUNDS") orelse h.core.fill_rounds;
+         h.core.fill_first = envInt("TF_FILL_FIRST") orelse 0; // the first piece's chunks: a prompt that short runs whole
++        // TF_FILL_CUT_IN=T (with TF_FILL_CHUNKS): a prompt of at most T tokens runs between another pass's pieces
++        h.core.cut_in = envInt("TF_FILL_CUT_IN") orelse 0;
+         h.host = api.LaneHost.init(h.gpa, io, &h.core, info);
+         h.host.memory = if (h.gpu != null) .{ .read = readMemory } else null;
+         h.host.explain = explain;
+-- 
+2.51.1
+

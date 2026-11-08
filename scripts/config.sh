@@ -54,5 +54,6 @@ TF_MEMORY_RESERVE_GIB=${TF_MEMORY_RESERVE_GIB:-}  # rank 0's CUDA reserve in GiB
 INPUTS_CONTEXT=${INPUTS_CONTEXT:-1048576}        # window and streams of step 5's one Python start; the rank caches
 INPUTS_PARALLEL=${INPUTS_PARALLEL:-4}            # do not depend on them (their key is the checkpoint and its config)
 SERVE_EXTRA=${SERVE_EXTRA:-}                      # more tensorfold-native serve arguments, e.g. --prompt-cache-gib 1
+GRAPH_CAP=${GRAPH_CAP:-128}                      # captured CUDA graphs kept per rank (0: all, which grows for days)
 TP_PORT=29620
 CONTAINER=dsv41-1017-tf

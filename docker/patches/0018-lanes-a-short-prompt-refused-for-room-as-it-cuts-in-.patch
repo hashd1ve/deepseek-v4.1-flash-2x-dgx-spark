@@ -1,0 +1,148 @@
+From f58f64643f5c28fe8817aa8562bf00702dd5eed0 Mon Sep 17 00:00:00 2001
+From: Blackwellboy <76774064+Blackwellboy@users.noreply.github.com>
+Date: Sun, 25 Oct 2026 15:16:28 +1100
+Subject: [PATCH 18/20] lanes: a short prompt refused for room as it cuts in
+ waits in the queue, as it does without TF_FILL_CUT_IN
+
+With TF_FILL_CUT_IN set and no stream decoding, a short request whose pass the backend refused for room
+(error.ContextFull) failed: it went back to the queue only while other streams ran, and the pass in pieces is not
+counted there. It now waits in the queue while a pass fills too, and runs between that pass's later pieces or after
+it, as it does with the switch unset. The dsv41 backend's pause check also refuses a cut-in that has images; the host
+already keeps those out, so this is only a guard.
+
+(cherry picked from commit 80fea5d2cb9cceaa902dd6e6d89b0005fda54eb6)
+---
+ zig/src/core/lane_host.zig       |  9 +++++----
+ zig/src/core/lane_host_test.zig  | 22 ++++++++++++++++------
+ zig/src/families/dsv41/lanes.zig | 16 +++++++++++++++-
+ 3 files changed, 36 insertions(+), 11 deletions(-)
+
+diff --git a/zig/src/core/lane_host.zig b/zig/src/core/lane_host.zig
+index 7c1a1f32..83b94b84 100644
+--- a/zig/src/core/lane_host.zig
++++ b/zig/src/core/lane_host.zig
+@@ -368,7 +368,8 @@ pub const LaneHost = struct {
+         if (h.loneFits(job)) return h.runLone(job, began);
+         h.core.addStream(&job.stream) catch |e| {
+             if (e == error.Cancelled) return h.cancel(job);
+-            if (e == error.ContextFull and h.core.activeCount() > 0) return h.requeue(job);
++            // refused for room: while other streams run or a pass fills (this one cut in), it waits in the queue
++            if (e == error.ContextFull and (h.core.activeCount() > 0 or h.filling != null)) return h.requeue(job);
+             return h.drop(job, h.words(e));
+         };
+         if (h.core.filling == &job.stream) {
+@@ -468,9 +469,9 @@ pub const LaneHost = struct {
+         return true;
+     }
+ 
+-    /// A request whose prompt pass the backend's pool cannot hold while other streams run (error.ContextFull, before
+-    /// anything of it was placed) goes back to the queue's front and waits until one of them ends, as the Python
+-    /// lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
++    /// A request whose prompt pass the backend's pool cannot hold while other streams run or a pass fills (ContextFull,
++    /// before anything of it was placed) goes back to the queue's front and waits until one of them ends, as the
++    /// Python lane's window waits, instead of failing, or a second at most (the backend may place it by then). Returns
+     /// false: nothing more is admitted now.
+     fn requeue(h: *LaneHost, job: *Job) bool {
+         h.remove(job);
+diff --git a/zig/src/core/lane_host_test.zig b/zig/src/core/lane_host_test.zig
+index 87134b04..a8706236 100644
+--- a/zig/src/core/lane_host_test.zig
++++ b/zig/src/core/lane_host_test.zig
+@@ -439,22 +439,22 @@ const CutIn = struct {
+ 
+     const long = [_]u32{ 2, 7, 1, 8, 2, 8, 1, 8, 2, 8 };
+ 
+-    /// The long request, then `second`, cut_in 4: the chunk order (caller frees), each reply checked as the fake's.
+-    fn run(second: []const u32) ![][2]usize {
++    /// The long request, then `second`: the chunk order (caller frees), each reply checked as the fake's.
++    fn run(second: []const u32, opts: struct { cut_in: u32 = 4, refuse_full: usize = 0 }) ![][2]usize {
+         const gpa = std.testing.allocator;
+         var cfg = try lanes.Config.init(gpa, .{ .exact_width = 8, .gpu_tokens = true, .hidden_rows = true }, 8, 7);
+         defer cfg.deinit(gpa);
+         var w: CutIn = .{};
+         defer w.a.deinit(gpa);
+         defer w.b.deinit(gpa);
+-        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w };
++        var target: lanes.fake.Fake = .{ .gpa = gpa, .prefill_chunks = 6, .prefill_hook = hook, .prefill_hook_ctx = &w, .refuse_full = opts.refuse_full };
+         defer target.deinit();
+         var clock: lanes.fake.FixedClock = .{};
+         var core = lanes.Engine.init(gpa, &cfg, target.backend(), clock.clock());
+         defer core.deinit();
+         core.fill_chunks = 1;
+         core.fill_rounds = 2;
+-        core.cut_in = 4;
++        core.cut_in = opts.cut_in;
+         var host = LaneHost.init(gpa, std.testing.io, &core, .{ .lanes = 2 });
+         try host.start();
+         defer host.stop();
+@@ -466,6 +466,7 @@ const CutIn = struct {
+         w.sent = true;
+         w.mutex.unlock(std.testing.io);
+         try w.until(.done);
++        try std.testing.expectEqual(@as(usize, 0), target.refuse_full);
+         for ([_][]const u32{ &long, second }, [_][]const u32{ w.a.items, w.b.items }) |prompt, reply| {
+             var history: std.ArrayList(u32) = .empty;
+             defer history.deinit(gpa);
+@@ -481,7 +482,7 @@ const CutIn = struct {
+ };
+ 
+ test "a short prompt cuts in: its whole pass runs between a long pass's pieces, and both replies are unchanged" {
+-    const order = try CutIn.run(&.{ 3, 1, 4 });
++    const order = try CutIn.run(&.{ 3, 1, 4 }, .{});
+     defer std.testing.allocator.free(order);
+     try std.testing.expectEqual(@as(usize, 12), order.len);
+     // the long pass's first chunk, the short pass whole, then the long pass's other five chunks
+@@ -491,9 +492,18 @@ test "a short prompt cuts in: its whole pass runs between a long pass's pieces,
+ }
+ 
+ test "a prompt longer than cut_in waits for the pass in pieces, as before" {
+-    const order = try CutIn.run(&.{ 3, 1, 4, 1, 5 });
++    const order = try CutIn.run(&.{ 3, 1, 4, 1, 5 }, .{});
+     defer std.testing.allocator.free(order);
+     try std.testing.expectEqual(@as(usize, 12), order.len);
+     for (order[0..6], 0..) |o, i| try std.testing.expectEqual([2]usize{ CutIn.long.len, i }, o);
+     for (order[6..12], 0..) |o, i| try std.testing.expectEqual([2]usize{ 5, i }, o);
+ }
++
++test "a short prompt refused for room as it cuts in waits in the queue and then runs, as it does without cut_in" {
++    // the fake refuses the short pass once (error.ContextFull) while the long pass holds its lane; its reply is whole
++    for ([_]u32{ 4, 0 }) |cut_in| {
++        const order = try CutIn.run(&.{ 3, 1, 4 }, .{ .cut_in = cut_in, .refuse_full = 1 });
++        defer std.testing.allocator.free(order);
++        try std.testing.expectEqual(@as(usize, 12), order.len);
++    }
++}
+diff --git a/zig/src/families/dsv41/lanes.zig b/zig/src/families/dsv41/lanes.zig
+index ceaba6a1..33b019eb 100644
+--- a/zig/src/families/dsv41/lanes.zig
++++ b/zig/src/families/dsv41/lanes.zig
+@@ -447,7 +447,7 @@ pub const Lanes = struct {
+         };
+         if (self.fill) |f| if (f.s != s) {
+             // a prompt cuts in between this pass's pieces: it waits (one at most, no images), its next piece resumes it
+-            if (self.paused != null or f.s.images.len > 0) return error.FillBusy;
++            if (self.paused != null or f.s.images.len > 0 or s.images.len > 0) return error.FillBusy;
+             self.paused = f;
+             self.fill = null;
+         };
+@@ -1223,3 +1223,17 @@ test "a prefix two conversations share: the second one resuming it in place woul
+     try std.testing.expect(ln.keptOver(shared.base + shared.at, shared.base + 55296, &shared)); // the second one moves
+     try std.testing.expect(!ln.keptOver(later.base + later.at, later.base + 432128, &later)); // the first one's next turn stays
+ }
++
++test "a prompt with images does not cut in between another pass's pieces" {
++    var m: Model = undefined;
++    m.io = std.testing.io;
++    var ln: Lanes = .{ .gpa = std.testing.allocator, .m = &m, .peer = null };
++    var long: lanes.Stream = undefined;
++    long.images = &.{};
++    var short: lanes.Stream = undefined;
++    const image = [_]lanes.stream.Image{.{ .at = 0, .tokens = 1, .bytes = "" }};
++    short.images = &image;
++    ln.fill = .{ .s = &long, .slot = 0, .len = 16, .replay = 0, .last_end = 0, .start = 8 };
++    try std.testing.expectError(error.FillBusy, ln.prefillPart(&short, 1));
++    try std.testing.expect(ln.paused == null and ln.fill.?.s == &long); // the pass in pieces stays as it was
++}
+-- 
+2.51.1
+

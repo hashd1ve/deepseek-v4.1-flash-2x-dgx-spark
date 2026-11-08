@@ -53,7 +53,7 @@ rank1_cmd() {
   echo "docker run -d --name $CONTAINER $(run_opts "$WORKER_DATA_DIR" "$WORKER_IFACE" "$WORKER_HCA") -e TF_DS_REPLAY_FLOOR=1" \
     "--entrypoint /opt/tf/bin/tf-dsv41-lanes $IMAGE /model /cache/tf-ds-rank 1 2 $HEAD_IP $TP_PORT /kit" \
     "--engram /engram --token-map /cache/dsv41_token_map.json --pool $CONTEXT --rdma $WORKER_HCA" \
-    "--graphs 1 --side 1 --prefetch 1 --aio 1"
+    "--graphs 1 --graph-cap ${GRAPH_CAP:-128} --side 1 --prefetch 1 --aio 1"
 }
 
 rank0_cmd() {  # extra arguments go to tensorfold-native serve
@@ -64,7 +64,7 @@ rank0_cmd() {  # extra arguments go to tensorfold-native serve
     "${TF_FILL_FIRST:+-e TF_FILL_FIRST=$TF_FILL_FIRST}" \
     "${TF_MEMORY_RESERVE_GIB:+-e TENSORFOLD_MEMORY_RESERVE_GIB=$TF_MEMORY_RESERVE_GIB} -e TF_TP_WORLD=2 -e TF_TP_MASTER=$HEAD_IP -e TF_TP_PORT=$TP_PORT -e TF_DS_RANK_CACHE=/cache/tf-ds-rank" \
     "-e TF_DS_KIT=/kit -e TENSORFOLD_CUDA_KERNELS=/kit/aot -e TF_DS_ENGRAM=/engram" \
-    "-e TF_DS_TOKEN_MAP=/cache/dsv41_token_map.json -e TF_RDMA_DEVICES=$HCA -e TF_DS_GRAPHS=1 -e TF_DS_HC_SIDE=1" \
+    "-e TF_DS_TOKEN_MAP=/cache/dsv41_token_map.json -e TF_RDMA_DEVICES=$HCA -e TF_DS_GRAPHS=1 -e TF_DS_GRAPH_CAP=${GRAPH_CAP:-128} -e TF_DS_HC_SIDE=1" \
     "-e TF_DS_L2_PREFETCH=1 -e TF_DS_ENGRAM_AIO=1 --entrypoint /opt/tf/native/bin/tensorfold-native $IMAGE" \
     "serve /model --host $HOST --port $PORT --name $MODEL_NAME $keyarg --context $CONTEXT --parallel $PARALLEL" \
     "--thinking --max-tokens $MAX_TOKENS --temperature 1.0 --top-p 0.95 --top-k 20 --backend cuda ${SERVE_EXTRA:-} $*"
