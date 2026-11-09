@@ -21,7 +21,9 @@ TensorFold's main (#1180); 0013 is ours (their test fitted to this branch).
 0014-0016, 0019 and 0020 come from MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks, zig/patches (Apache-2.0): 0010
 (Mia's AI Lab's port of William J Riley's idle nap, bertholomus/TensorFold #27), 0011 (Robert Wojciechowski), 0032 (Maciej
 Kowalik), 0033 (E-Zou Shen, ported here: this branch's graph key has no shard mode) and 0038 (Mia's AI Lab). 0017 and
-0018 are bertholomus/TensorFold #43 by Blackwellboy (16701b4, 80fea5d). Each patch carries its author.
+0018 are bertholomus/TensorFold #43 by Blackwellboy (16701b4, 80fea5d). 0021, 0022 and 0024 come from the same recipe:
+0049 (Lukasz Raczylo), 0035 (Hector Isaza, without the hunks that need their 0020) and 0045 (Dick Lai, ported here: this
+branch has no durable tier or KV parts). 0023 and 0025 are ours. Each patch carries its author.
 
 model/chat_template.jinja is the template the checkpoint easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw carries,
 written by Mia's AI Lab as a port of DeepSeek's encoding/encoding.py (DeepSeek, MIT), with one change: each piece of

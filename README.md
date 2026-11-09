@@ -84,6 +84,16 @@ details.
   thread at 0.2 % of a core. `0015` (by [Robert Wojciechowski](https://github.com/wojo)) counts the free pages parked on the
   per-CPU lists when a start budgets its memory, and `0020` (by Mia's AI Lab) keeps the indexer's views on the 16-byte
   boundary its kernels were captured for. All four come from [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) (`0010`, `0011`, `0032`, `0038`).
+- **A short turn of a long conversation waited out any long prompt.** The cut-in above counted the whole prompt, so a
+  362-token turn on a 25K-token conversation was a long one. `0024` (by [Dick Lai](https://github.com/laidick), from
+  [Mia's AI Lab's recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks), its `0045`) counts the tokens it computes past its kept state. Behind a 126K-token prompt: first token after
+  60.5 s without it, 0.84 s with it, the same reply. A turn of 13K new tokens still waits.
+- **An Engram read that failed on one rank left the other waiting.** `0022` (by [Hector Isaza](https://github.com/hecisaza),
+  their `0035`) reports it as a rank fault, refuses a table too short at start and joins its readers on every exit. Their
+  `0020`, which ends the pair, is not in this recipe, so `0023` (ours) exits that rank with status 75 and
+  `ops/keep_serving.sh` restarts both. Unit tests cover the fault; the exit has not been triggered on a real pair.
+- **The first request after a start drafted shallower than later ones.** `0021` (by
+  [Lukasz Raczylo](https://github.com/lukaszraczylo), their `0049`) gives a stream's first drafts the head's depth.
 
 ## Results
 
@@ -91,11 +101,11 @@ On our pair, at `--context 1048576 --parallel 4` with the settings in `scripts/l
 
 | | |
 | --- | --- |
-| Decode, one stream (`kit_bench.py`, set a) | code 86.7, prose 57.0, structured 104.4 tok/s |
+| Decode, one stream (`kit_bench.py`, set a) | code 86.5, prose 56.2, structured 102.6 tok/s |
 | Prompt processing | ~2,050–2,150 tok/s from 8K to 160K tokens (`kit_bench.py`); a 1,040,000-token prompt in 653 s; `tests/prefill_speed.py` on a 50K-token prompt of source code: 2,031–2,047 tok/s with `TF_DS_ENGRAM_LEAD=1`, 1,961–1,995 without it (the same on the `45c25b1b` pin) |
 | Exactness | 12 greedy replies byte-identical to the unpatched engine; resumed prompts equal fresh ones; tool calls 10/10; `tests/quoted_prose_tail.py` 3/3 (0/3 before `0009`, `0010` and #35); `tests/think_quote.py` 2/2 (0/2 before `0011`-`0013`) |
 | Template | `/tokenize` ids identical for 1,500 random conversations; 5,000 identical renders in jinja2 |
-| Engine tests | `zig build test`: 248/248; the server's (`zig/tests/server/zig_test.sh`): all pass |
+| Engine tests | `zig build test`: 257/257; the server's (`zig/tests/server/zig_test.sh`): all pass |
 
 The checkpoint's quality is measured in its [model card](https://huggingface.co/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw):
 against DeepSeek's FP8 release on the same 100 × 2,048 tokens, KL 0.0864 and top-1 agreement 90.8%.
@@ -206,16 +216,18 @@ This builds on other people's work.
 - **[Mia's AI Lab](https://github.com/MiaAI-Lab):** the 2.9 bpw layout the checkpoint follows and the chat template it
   carries, which `model/chat_template.jinja` changes; the layout of these scripts comes from their GLM-5.3-Flash recipe.
   Their [two-Spark DeepSeek-V4.1 recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) (Apache-2.0)
-  and the people who send it patches are where `0009`, `0014`-`0016`, `0019` and `0020` come from.
+  and the people who send it patches are where `0009`, `0014`-`0016`, `0019`-`0022` and `0024` come from.
 - **[E-Zou Shen](https://github.com/ezoushen)** (`0019`), **[Maciej Kowalik](https://github.com/koniaik)** (`0016`),
   **[Robert Wojciechowski](https://github.com/wojo)** (`0015`), **[William J Riley](https://github.com/willjriley)** (the
-  nap `0014` ports) and **[Blackwellboy](https://github.com/Blackwellboy)** (`0017`-`0018`).
+  nap `0014` ports) **[Blackwellboy](https://github.com/Blackwellboy)** (`0017`-`0018`),
+  **[Lukasz Raczylo](https://github.com/lukaszraczylo)** (`0021`), **[Hector Isaza](https://github.com/hecisaza)** (`0022`) and
+  **[Dick Lai](https://github.com/laidick)** (`0024`).
 - **[turboderp](https://github.com/turboderp-org):** [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and the
   EXL3 format (MIT).
 - **NVIDIA:** the DGX Spark and the [PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
   the image is built on.
 
-The changes in this repository (the engine patches but `0009`-`0012` and `0014`-`0020`, the template change, the recipe changes, `ops/`
+The changes in this repository (the engine patches but `0009`-`0012`, `0014`-`0022` and `0024`, the template change, the recipe changes, `ops/`
 and `tests/`) are by [hashd1ve](https://github.com/hashd1ve). Not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors,
 Bertholomus AI, easthambuilds or Mia's AI Lab.
 
