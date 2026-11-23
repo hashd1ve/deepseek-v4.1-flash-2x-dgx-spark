@@ -6,10 +6,10 @@ Licensed under the Apache License, Version 2.0 (LICENSE).
 This repository is derived from easthambuilds' recipe
 https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold (Apache-2.0).
 start.sh, stop.sh, scripts/, tools/, docker/Dockerfile and the .gitignore come from it. Changed here: start.sh and
-stop.sh (stop.sh's mark for ops/keep_serving.sh),
+stop.sh (stop.sh's mark for ops/keep_serving.sh; start.sh's --taps and --edits),
 scripts/config.sh (the engine pin), scripts/common.sh (the image hash covers docker/patches/, rank 0's TF_FILL_*
-settings, ENGINE_ENV for both ranks, the containers' log rotation), scripts/prepare.sh (model/chat_template.jinja put in place), scripts/local.sh.example (the TF_FILL_*
-settings and ENGINE_ENV) and docker/Dockerfile (docker/patches/ applied to the Zig engine). README.md is new; it reuses parts of
+settings and taps, ENGINE_ENV for both ranks, the containers' log rotation), scripts/prepare.sh (model/chat_template.jinja put in place), scripts/local.sh.example (the TF_FILL_*
+settings, ENGINE_ENV, the taps and edits) and docker/Dockerfile (docker/patches/ applied to the Zig engine). README.md is new; it reuses parts of
 the recipe's README.
 
 docker/patches/ are changes to Bertholomus AI's TensorFold fork, branch deepseek-v41-zig
@@ -23,7 +23,10 @@ TensorFold's main (#1180); 0013 is ours (their test fitted to this branch).
 Kowalik), 0033 (E-Zou Shen, ported here: this branch's graph key has no shard mode) and 0038 (Mia's AI Lab). 0017 and
 0018 are bertholomus/TensorFold #43 by Blackwellboy (16701b4, 80fea5d). 0021, 0022 and 0024 come from the same recipe:
 0049 (Lukasz Raczylo), 0035 (Hector Isaza, without the hunks that need their 0020) and 0045 (Dick Lai, ported here: this
-branch has no durable tier or KV parts). 0023 and 0025 are ours. Each patch carries its author.
+branch has no durable tier or KV parts). 0023, 0025, 0026 and 0027 are ours. 0028 and 0029 come from the same recipe:
+0064 (Hector Isaza, from 0053 of their 4-Spark recipe; without its end-to-end test file, which this branch does not
+have) and 0050 (Lukasz Raczylo; three hunks applied by hand where the context differs here). Each patch carries its
+author.
 
 model/chat_template.jinja is the template the checkpoint easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw carries,
 written by Mia's AI Lab as a port of DeepSeek's encoding/encoding.py (DeepSeek, MIT), with one change: each piece of

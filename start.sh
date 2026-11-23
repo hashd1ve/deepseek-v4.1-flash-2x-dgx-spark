@@ -1,6 +1,7 @@
 #!/bin/bash
-# start.sh [restart] [tensorfold-native serve arguments...]: set up both Sparks if needed, start rank 1 on the worker
-# and rank 0 (the API) here, wait until they load, and send one smoke-test request through both.
+# start.sh [restart] [--stock|--abliterated] [--taps|--no-taps] [--edits|--no-edits] [tensorfold-native serve arguments...]:
+# set up both Sparks if needed, start rank 1 on the worker and rank 0 (the API) here, wait until they load, and send one
+# smoke-test request through both.
 . "$(dirname "$0")/scripts/common.sh"
 . "$ROOT/scripts/ablit.sh"
 RESTART=0
@@ -9,6 +10,10 @@ while [ "$#" -gt 0 ]; do
     restart) RESTART=1; shift ;;
     --abliterated) ABLIT=1; shift ;;
     --stock) ABLIT=0; shift ;;
+    --taps) TAPS=1; shift ;;
+    --no-taps) TAPS=0; shift ;;
+    --edits) EDITS=1; shift ;;
+    --no-edits) EDITS=0; shift ;;
     *) break ;;
   esac
 done
@@ -44,6 +49,23 @@ done
 ss -ltn | grep -q ":$PORT " && die "port $PORT is in use here"
 
 step "Launch"
+# --taps (or TAPS=1 in scripts/local.sh, which ops/keep_serving.sh's restarts keep; docker/patches/0026): a request with
+# "taps": "name" has its prompt pass write the streams entering each of TAPS_LAYERS to DATA_DIR/xtaps/name.xtaps.
+# --edits (or EDITS=1; 0027; it turns the taps on too): a request with "edits": "name" has its prompt pass change the
+# streams as DATA_DIR/xtaps/name.xedit says, and with "taps" its "lens" and "streams" go to the taps file; both ranks
+# get EDITS_MIB of edit rows. TAPS_ROWS bounds a marked prompt (smaller buffers, so every layer can be listed).
+# Off, the engine allocates and launches nothing for either and ignores the fields. See docs/taps.md.
+TAPS_OPTS=""
+[ "${EDITS:-0}" = 1 ] && TAPS=1
+if [ "${TAPS:-0}" = 1 ]; then
+  mkdir -p "$DATA_DIR/xtaps"
+  TAPS_OPTS="-v $DATA_DIR/xtaps:/xtaps -e TF_DS_XTAPS=${TAPS_LAYERS:-8,12,16,20,24,28,32,36,40} -e TF_DS_XTAPS_DIR=/xtaps ${TAPS_ROWS:+-e TF_DS_XTAPS_ROWS=$TAPS_ROWS}"
+  note "taps on: layers ${TAPS_LAYERS:-8,12,16,20,24,28,32,36,40}, files in $DATA_DIR/xtaps${TAPS_ROWS:+, marked prompts of at most $TAPS_ROWS tokens}"
+fi
+if [ "${EDITS:-0}" = 1 ]; then
+  ENGINE_ENV="${ENGINE_ENV:-} -e TF_DS_XEDIT=${EDITS_MIB:-16}"
+  note "edits on: ${EDITS_MIB:-16} MiB of edit rows on each rank, files in $DATA_DIR/xtaps"
+fi
 on_worker "$(rank1_cmd)" >/dev/null
 note "rank 1 started on $WORKER"
 eval "$(rank0_cmd "$@")" >/dev/null

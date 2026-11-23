@@ -29,3 +29,13 @@ TF_FILL_FIRST=4
 # pair, the same replies. A short prompt runs between a long pass's pieces (TF_FILL_CUT_IN, tokens at most; TensorFold#43).
 # The RDMA proxy naps after 2 s idle instead of spinning a core (TF_RDMA_NAP_US). ENGINE_ENV is passed to both ranks' containers.
 ENGINE_ENV="-e TF_DS_ENGRAM_LEAD=1 -e TF_FILL_CUT_IN=8192 -e TF_RDMA_NAP_US=500"
+# Per-stream draft calibration (docker/patches/0029, off unless set): add -e TF_DS_T25_DRAFT_CAL=0.05 to ENGINE_ENV.
+# Its author measured prose 79.7 -> 85.4 tok/s and code unchanged on their own engine line; not measured on this recipe.
+
+# Optional: reading and editing the residual streams of marked requests (docker/patches/0026-0027, docs/taps.md).
+# Set here, ops/keep_serving.sh's restarts keep them; ./start.sh --taps / --edits turn them on for one start.
+# TAPS=1
+# TAPS_LAYERS=8,12,16,20,24,28,32,36,40   # the layers whose input streams a marked prompt pass writes (0-40)
+# TAPS_ROWS=256                           # a marked prompt's tokens at most (smaller buffers: then every layer fits)
+# EDITS=1                                 # also edits, lens and streams (turns TAPS on)
+# EDITS_MIB=32                            # MiB of edit rows on each rank

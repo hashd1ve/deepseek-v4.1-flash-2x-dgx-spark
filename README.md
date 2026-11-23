@@ -11,7 +11,7 @@ It starts from [easthambuilds' recipe](https://github.com/easthambuilds/DeepSeek
 
 | | |
 | --- | --- |
-| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `2aa3c47d`, which includes five of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#25](https://github.com/bertholomus/TensorFold/pull/25), [#26](https://github.com/bertholomus/TensorFold/pull/26), [#28](https://github.com/bertholomus/TensorFold/pull/28), [#29](https://github.com/bertholomus/TensorFold/pull/29)), plus [`docker/patches/`](docker/patches): tool calls streamed as they are written (`0005`), a request's memory held to its prompt (`0006`-`0008`), the text before tool calls kept as the content (`0009`, from Mia's AI Lab's recipe), quoted control tokens kept as text (`0010`, [#36](https://github.com/bertholomus/TensorFold/pull/36)) the reasoning ended at the model's own close token (`0011`-`0013`, from TensorFold's main), and the stability and latency fixes `0014`-`0020`, most of them from Mia's AI Lab's recipe |
+| Engine | [`bertholomus/TensorFold`](https://github.com/bertholomus/TensorFold) `deepseek-v41-zig` @ `2aa3c47d`, which includes five of our fixes ([#24](https://github.com/bertholomus/TensorFold/pull/24), [#25](https://github.com/bertholomus/TensorFold/pull/25), [#26](https://github.com/bertholomus/TensorFold/pull/26), [#28](https://github.com/bertholomus/TensorFold/pull/28), [#29](https://github.com/bertholomus/TensorFold/pull/29)), plus [`docker/patches/`](docker/patches): tool calls streamed as they are written (`0005`), a request's memory held to its prompt (`0006`-`0008`), the text before tool calls kept as the content (`0009`, from Mia's AI Lab's recipe), quoted control tokens kept as text (`0010`, [#36](https://github.com/bertholomus/TensorFold/pull/36)) the reasoning ended at the model's own close token (`0011`-`0013`, from TensorFold's main), the stability and latency fixes `0014`-`0025` and `0028`-`0029`, most of them from Mia's AI Lab's recipe, and optional taps and edits of the residual streams (`0026`-`0027`, [docs/taps.md](docs/taps.md)) |
 | Chat template | [`model/chat_template.jinja`](model/chat_template.jinja): the published template, rendering the same prompt without rank 0's memory growing with the conversation |
 | Recipe | easthambuilds' scripts with the changes from [easthambuilds#1](https://github.com/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2x-DGX-Sparks-TensorFold/pull/1) (the 512/513-token kit variant, kept rank caches, a CDI preflight, settings for a tight memory budget) and prompt passes in pieces |
 | Operations | [`ops/`](ops): the kernel memory settings, the memory watchdog and a supervisor that starts the server again when it goes down on its own |
@@ -94,6 +94,20 @@ details.
   `ops/keep_serving.sh` restarts both. Unit tests cover the fault; the exit has not been triggered on a real pair.
 - **The first request after a start drafted shallower than later ones.** `0021` (by
   [Lukasz Raczylo](https://github.com/lukaszraczylo), their `0049`) gives a stream's first drafts the head's depth.
+- **A short malformed tool-call block could stop rank 0.** A `<tool_call>` block whose payload opens with a DSML opener
+  but is shorter than the opener and its closer together was sliced past its own start, a panic under the image's
+  ReleaseSafe build, and `ops/keep_serving.sh` then restarts both ranks (about a minute, and the kept prompt states are
+  lost). `0028` (by [Hector Isaza](https://github.com/hecisaza), their `0064`) reads it as no DSML block; every payload
+  long enough reads as before.
+- **Draft depth can follow each stream's own acceptance** (opt-in). `0029` (by Lukasz Raczylo, their `0050`) keeps, per
+  stream, how many drafts its verifies kept against how many the allocator expected and scales the allocator's chances
+  by it, with `TF_DS_T25_DRAFT_CAL` set (e.g. `-e TF_DS_T25_DRAFT_CAL=0.05` in `ENGINE_ENV`). Unset, the allocator gets
+  the same chances as before: the 12 greedy replies stay byte-identical. Its author measured prose 79.7 → 85.4 tok/s
+  and code unchanged on their own engine line; we have not measured it on this recipe.
+- **Looking inside the model while it serves** (opt-in). `0026`-`0027` (ours) let a marked request write the residual
+  streams entering chosen layers to a file, read a logit lens at each, and steer, patch or ablate the streams before a
+  layer reads them. `./start.sh --taps` / `--edits`; [docs/taps.md](docs/taps.md) has the request fields and the file
+  formats. Off, the engine allocates and launches nothing for them.
 
 ## Results
 
@@ -101,11 +115,11 @@ On our pair, at `--context 1048576 --parallel 4` with the settings in `scripts/l
 
 | | |
 | --- | --- |
-| Decode, one stream (`kit_bench.py`, set a) | code 86.5, prose 56.2, structured 102.6 tok/s |
-| Prompt processing | ~2,050–2,150 tok/s from 8K to 160K tokens (`kit_bench.py`); a 1,040,000-token prompt in 653 s; `tests/prefill_speed.py` on a 50K-token prompt of source code: 2,031–2,047 tok/s with `TF_DS_ENGRAM_LEAD=1`, 1,961–1,995 without it (the same on the `45c25b1b` pin) |
+| Decode, one stream (`kit_bench.py`, set a, median of 3) | code 86.9, prose 57.2, structured 97.6 tok/s (structured ranged 77–105 across the 3 runs; 102.6 on the build before `0026`-`0029`) |
+| Prompt processing | ~2,050–2,150 tok/s from 8K to 160K tokens (`kit_bench.py`); a 1,040,000-token prompt in 653 s; `tests/prefill_speed.py` on a 50K-token prompt of source code: 2,040–2,066 tok/s with `TF_DS_ENGRAM_LEAD=1`, with or without the taps and edits on (1,961–1,995 without the lead, on an earlier build) |
 | Exactness | 12 greedy replies byte-identical to the unpatched engine; resumed prompts equal fresh ones; tool calls 10/10; `tests/quoted_prose_tail.py` 3/3 (0/3 before `0009`, `0010` and #35); `tests/think_quote.py` 2/2 (0/2 before `0011`-`0013`) |
 | Template | `/tokenize` ids identical for 1,500 random conversations; 5,000 identical renders in jinja2 |
-| Engine tests | `zig build test`: 257/257; the server's (`zig/tests/server/zig_test.sh`): all pass |
+| Engine tests | `zig build test`: 276/276; the server's (`zig/tests/server/zig_test.sh`): all pass |
 
 The checkpoint's quality is measured in its [model card](https://huggingface.co/easthambuilds/DeepSeek-V4.1-Flash-1017-EXL3-2.9bpw):
 against DeepSeek's FP8 release on the same 100 × 2,048 tokens, KL 0.0864 and top-1 agreement 90.8%.
@@ -153,6 +167,9 @@ Optional [Keys abliteration overlay](docs/ablit.md): `./start.sh restart --ablit
 `./start.sh restart --stock` restores stock. Stock remains the default. The overlay changes only derived rank-cache
 fragments, keeps the base checkpoint and MTP untouched, and needs about 1.3 GiB extra per Spark.
 
+Optional [taps and edits](docs/taps.md) of the residual streams for marked requests: `./start.sh restart --taps` or
+`--edits` (or `TAPS=1` / `EDITS=1` in `scripts/local.sh`, which the supervisor's restarts keep).
+
 `ops/keep_serving.sh` starts the server again when a rank goes down without `./stop.sh` (a crash, or
 `ops/memory_watchdog.sh` stopping it), at most 3 times in 2 hours; its log is `DATA_DIR/keep_serving.log`. With it
 running, stop the server with `./stop.sh`, never with `docker stop`.
@@ -190,7 +207,8 @@ Each step skips work already done, so it is safe to re-run.
 | `TF_MEMORY_RESERVE_GIB` | 4 | rank 0's CUDA reserve; the default (a tenth of the memory, ~12.2 GiB) leaves the weights no room with our kernel settings |
 | `SERVE_EXTRA` | `--prompt-cache-gib 0.5` | the kept prompt states' budget |
 | `INPUTS_CONTEXT`, `INPUTS_PARALLEL` | 65536, 1 | the window of step 5's one Python start (less memory; the rank caches are the same) |
-| `ENGINE_ENV` | `-e TF_DS_ENGRAM_LEAD=1` | extra `-e NAME=value` options for both ranks' containers (the engine's opt-in settings, such as `TF_DS_ENGRAM_LEAD=1`) |
+| `ENGINE_ENV` | `-e TF_DS_ENGRAM_LEAD=1` | extra `-e NAME=value` options for both ranks' containers (the engine's opt-in settings, such as `TF_DS_ENGRAM_LEAD=1` or `TF_DS_T25_DRAFT_CAL`) |
+| `TAPS`, `TAPS_LAYERS`, `TAPS_ROWS`, `EDITS`, `EDITS_MIB` | unset (off) | taps and edits of the residual streams for marked requests ([docs/taps.md](docs/taps.md)) |
 
 On the Sparks themselves: [`ops/memory_watchdog.sh`](ops/memory_watchdog.sh) stops the engine's container before a
 GB10 runs out of memory and stalls, and [`ops/memlog.sh`](ops/memlog.sh) logs where the memory goes every 30 s.
@@ -216,18 +234,18 @@ This builds on other people's work.
 - **[Mia's AI Lab](https://github.com/MiaAI-Lab):** the 2.9 bpw layout the checkpoint follows and the chat template it
   carries, which `model/chat_template.jinja` changes; the layout of these scripts comes from their GLM-5.3-Flash recipe.
   Their [two-Spark DeepSeek-V4.1 recipe](https://github.com/MiaAI-Lab/DeepSeek-v4.1-Flash-1017-2x-DGX-Sparks) (Apache-2.0)
-  and the people who send it patches are where `0009`, `0014`-`0016`, `0019`-`0022` and `0024` come from.
+  and the people who send it patches are where `0009`, `0014`-`0016`, `0019`-`0022`, `0024`, `0028` and `0029` come from.
 - **[E-Zou Shen](https://github.com/ezoushen)** (`0019`), **[Maciej Kowalik](https://github.com/koniaik)** (`0016`),
   **[Robert Wojciechowski](https://github.com/wojo)** (`0015`), **[William J Riley](https://github.com/willjriley)** (the
   nap `0014` ports) **[Blackwellboy](https://github.com/Blackwellboy)** (`0017`-`0018`),
-  **[Lukasz Raczylo](https://github.com/lukaszraczylo)** (`0021`), **[Hector Isaza](https://github.com/hecisaza)** (`0022`) and
+  **[Lukasz Raczylo](https://github.com/lukaszraczylo)** (`0021`, `0029`), **[Hector Isaza](https://github.com/hecisaza)** (`0022`, `0028`) and
   **[Dick Lai](https://github.com/laidick)** (`0024`).
 - **[turboderp](https://github.com/turboderp-org):** [ExLlamaV3](https://github.com/turboderp-org/exllamav3) and the
   EXL3 format (MIT).
 - **NVIDIA:** the DGX Spark and the [PyTorch container](https://catalog.ngc.nvidia.com/orgs/nvidia/containers/pytorch)
   the image is built on.
 
-The changes in this repository (the engine patches but `0009`-`0012`, `0014`-`0022` and `0024`, the template change, the recipe changes, `ops/`
+The changes in this repository (the engine patches but `0009`-`0012`, `0014`-`0022`, `0024`, `0028` and `0029`, the template change, the recipe changes, `ops/`
 and `tests/`) are by [hashd1ve](https://github.com/hashd1ve). Not affiliated with or endorsed by DeepSeek, NVIDIA, the TensorFold authors,
 Bertholomus AI, easthambuilds or Mia's AI Lab.
 

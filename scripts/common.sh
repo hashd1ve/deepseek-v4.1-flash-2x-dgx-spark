@@ -59,7 +59,7 @@ rank1_cmd() {
 rank0_cmd() {  # extra arguments go to tensorfold-native serve
   local key="" keyarg=""
   if [ -n "$API_KEY_FILE" ]; then key="-v $API_KEY_FILE:/run/api-key:ro"; keyarg="--api-key-file /run/api-key"; fi
-  echo "docker run -d --name $CONTAINER $(run_opts "$DATA_DIR" "$IFACE" "$HCA") $key -e TF_DS_REPLAY_FLOOR=1" \
+  echo "docker run -d --name $CONTAINER $(run_opts "$DATA_DIR" "$IFACE" "$HCA") $key ${TAPS_OPTS:-} -e TF_DS_REPLAY_FLOOR=1" \
     "${TF_FILL_CHUNKS:+-e TF_FILL_CHUNKS=$TF_FILL_CHUNKS} ${TF_FILL_ROUNDS:+-e TF_FILL_ROUNDS=$TF_FILL_ROUNDS}" \
     "${TF_FILL_FIRST:+-e TF_FILL_FIRST=$TF_FILL_FIRST}" \
     "${TF_MEMORY_RESERVE_GIB:+-e TENSORFOLD_MEMORY_RESERVE_GIB=$TF_MEMORY_RESERVE_GIB} -e TF_TP_WORLD=2 -e TF_TP_MASTER=$HEAD_IP -e TF_TP_PORT=$TP_PORT -e TF_DS_RANK_CACHE=/cache/tf-ds-rank" \
